@@ -1,0 +1,182 @@
+name: self-test
+
+# Proves the reusable workflows in this repo work AND that they fail when they
+# should. "Positive" jobs call the reusable workflows on this repo. "Negative"
+# jobs run the same pinned tools against planted bad input and require a
+# non-zero exit: a reusable-workflow call that fails would fail this run.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+# Tool pins used by the negative jobs. The same values are in the reusable
+# workflows; the drift-check job fails if they ever differ.
+env:
+  ACTIONLINT_VERSION: "1.7.12"
+  ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+  ZIZMOR_VERSION: "1.31.0"
+  ZIZMOR_SHA256: 95776c59c2d4c0d6e10560647b4830762b8dbcca8d7d9b7469ff227c73a6fee6
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+
+jobs:
+  secret-scan:
+    uses: ./.github/workflows/secret-scan.yml
+    permissions:
+      contents: read
+
+  workflow-lint:
+    uses: ./.github/workflows/workflow-lint.yml
+    permissions:
+      contents: read
+
+  actionlint-rejects-bad-workflow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint (checksum verified)
+        run: |
+          set -euo pipefail
+          f="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$f" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$f"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/$f" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP/bin" actionlint
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: actionlint must exit 1 on the planted fixture
+        run: |
+          set +e
+          out=$(actionlint -no-color fixtures/actionlint-bad/bad.yml 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -ne 1 ]; then echo "::error::expected actionlint exit 1, got $rc"; exit 1; fi
+          grep -q '\[job-needs\]' <<<"$out" || { echo "::error::expected a job-needs finding"; exit 1; }
+          echo "OK: actionlint rejected the planted workflow"
+
+  zizmor-rejects-bad-workflow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install zizmor (checksum verified)
+        run: |
+          set -euo pipefail
+          f="zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$f" "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/$f"
+          echo "${ZIZMOR_SHA256}  $RUNNER_TEMP/$f" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP/bin" zizmor
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: zizmor must exit non-zero on the planted fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          out=$(zizmor --format plain fixtures/zizmor-bad/bad.yml 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then echo "::error::zizmor accepted the planted fixture"; exit 1; fi
+          grep -q 'template-injection' <<<"$out" || { echo "::error::expected a template-injection finding (exit $rc)"; exit 1; }
+          echo "OK: zizmor rejected the planted workflow (exit $rc)"
+
+  gitleaks-rejects-planted-token:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install gitleaks (checksum verified)
+        run: |
+          set -euo pipefail
+          f="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$f" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$f"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$f" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP/bin" gitleaks
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Control scan passes, then a run-time fake token must fail
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/plant"
+          mkdir -p "$d"
+          echo "nothing secret here" > "$d/notes.txt"
+          gitleaks dir --no-banner --redact "$d"
+          echo "OK: control scan is clean"
+
+          # Fake token, generated now and never committed or reused.
+          suffix=$(openssl rand -base64 96 | tr -dc 'A-Za-z0-9' | head -c 36)
+          [ "${#suffix}" -eq 36 ]
+          printf 'github_token = "ghp_%s"\n' "$suffix" > "$d/config.txt"
+
+          set +e
+          out=$(gitleaks dir --no-banner --redact --verbose "$d" 2>&1)
+          rc=$?
+          set -e
+          echo "$out" | sed "s/${suffix}/<redacted>/g"
+          if [ "$rc" -eq 0 ]; then echo "::error::gitleaks accepted the planted token"; exit 1; fi
+          grep -q 'github-pat' <<<"$out" || { echo "::error::expected a github-pat finding (exit $rc)"; exit 1; }
+          echo "OK: gitleaks rejected the planted token (exit $rc)"
+
+  pins-match-reusable-workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Tool pins in self-test equal the reusable workflows
+        run: |
+          set -euo pipefail
+          get() { grep -hE "^ +$1:" "$2" | head -1 | sed -E 's/^ +[A-Z0-9_]+: *//; s/"//g'; }
+          check() {
+            local var=$1 file=$2
+            local a b
+            a=$(get "$var" .github/workflows/self-test.yml)
+            b=$(get "$var" "$file")
+            if [ -z "$a" ] || [ "$a" != "$b" ]; then
+              echo "::error::$var differs: self-test='$a' $file='$b'"; return 1
+            fi
+            echo "ok $var"
+          }
+          rc=0
+          for v in ACTIONLINT_VERSION ACTIONLINT_SHA256 ZIZMOR_VERSION ZIZMOR_SHA256; do
+            check "$v" .github/workflows/workflow-lint.yml || rc=1
+          done
+          for v in GITLEAKS_VERSION GITLEAKS_SHA256; do
+            check "$v" .github/workflows/secret-scan.yml || rc=1
+          done
+          exit "$rc"
+
+  ci-ok:
+    if: always()
+    needs:
+      - secret-scan
+      - workflow-lint
+      - actionlint-rejects-bad-workflow
+      - zizmor-rejects-bad-workflow
+      - gitleaks-rejects-planted-token
+      - pins-match-reusable-workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}

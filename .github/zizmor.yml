@@ -1,0 +1,6 @@
+# Applies to zizmor runs inside THIS repo only (callers use their own config).
+rules:
+  self-repository:
+    ignore:
+      # actionlint 1.7.12 rejects the newer `$/` syntax, so `./` stays for now.
+      - self-test.yml

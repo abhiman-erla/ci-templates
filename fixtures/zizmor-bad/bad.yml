@@ -1,0 +1,14 @@
+# PLANTED INSECURE WORKFLOW. Lives outside .github/workflows so it never runs.
+# zizmor must reject it: script injection from an
+# untrusted issue title, an unpinned action, and over-broad permissions.
+name: planted-zizmor-failure
+on:
+  issues:
+    types: [opened]
+permissions: write-all
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "${{ github.event.issue.title }}"

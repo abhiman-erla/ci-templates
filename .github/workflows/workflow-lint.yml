@@ -1,0 +1,70 @@
+name: workflow-lint
+
+# Reusable. Lints the CALLER's workflows with pinned actionlint and zizmor.
+# Fails the job on any finding. Tool versions and checksums live in the env
+# block below; self-test.yml has a drift check that compares them.
+on:
+  workflow_call:
+    inputs:
+      path:
+        description: File or directory of workflows to lint (self-test points this at a planted fixture)
+        type: string
+        default: .github/workflows
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      ACTIONLINT_VERSION: "1.7.12"
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+      ZIZMOR_VERSION: "1.31.0"
+      ZIZMOR_SHA256: 95776c59c2d4c0d6e10560647b4830762b8dbcca8d7d9b7469ff227c73a6fee6
+      LINT_PATH: ${{ inputs.path }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint (checksum verified)
+        run: |
+          set -euo pipefail
+          f="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$f" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$f"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/$f" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP/bin" actionlint
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Install zizmor (checksum verified)
+        run: |
+          set -euo pipefail
+          f="zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$f" "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/$f"
+          echo "${ZIZMOR_SHA256}  $RUNNER_TEMP/$f" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP/bin" zizmor
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(find "$LINT_PATH" -type f \( -name '*.yml' -o -name '*.yaml' \) -print0 | sort -z)
+          if [ "${#files[@]}" -eq 0 ]; then echo "::error::no workflow files found under $LINT_PATH"; exit 1; fi
+          actionlint -color "${files[@]}"
+          echo "actionlint: clean"
+
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(find "$LINT_PATH" -type f \( -name '*.yml' -o -name '*.yaml' \) -print0 | sort -z)
+          if [ "${#files[@]}" -eq 0 ]; then echo "::error::no workflow files found under $LINT_PATH"; exit 1; fi
+          zizmor --format plain "${files[@]}"
+          echo "zizmor: clean"
