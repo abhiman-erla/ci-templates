@@ -1012,6 +1012,23 @@ jobs:
           fi
           exit "$rc"
 
+  # deploy-render can't call Render from here, so its blocks run against a local
+  # fake server. Calling the workflow itself would need a real environment and
+  # hook; helios's first deploy proves that wiring.
+  deploy-render-cases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint the case script
+        run: shellcheck fixtures/fake-render/cases.sh
+
+      - name: Check the workflow's structure and run its blocks against the fake server
+        run: bash fixtures/fake-render/cases.sh
+
   ci-ok:
     if: always()
     needs:
@@ -1043,6 +1060,7 @@ jobs:
       - java-gates-trip
       - terraform-gates-trip
       - pins-match-reusable-workflows
+      - deploy-render-cases
     runs-on: ubuntu-latest
     steps:
       - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0

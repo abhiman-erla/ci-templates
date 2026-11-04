@@ -1,0 +1,168 @@
+name: deploy-render
+
+# Reusable. Deploys an image to a Render image-backed service by digest through
+# its deploy hook, then polls a health URL until it reports the new commit. An
+# old version keeps answering during a deploy, so a 200 alone proves nothing.
+#
+# self-test.yml extracts the marked blocks below and runs them against a local
+# fake server, because it cannot call Render. The poll count and delay read
+# POLL_ATTEMPTS and POLL_DELAY so it can shorten them. They are deliberately not
+# inputs and no step here sets them, so a real deploy always uses the defaults.
+on:
+  workflow_call:
+    inputs:
+      image-digest:
+        description: Image to deploy, as registry/name@sha256:<64 hex>. docker-build's image output has this form
+        type: string
+        required: true
+      health-url:
+        description: https URL that reports the deployed commit in its response body
+        type: string
+        required: true
+      expected-version:
+        description: Full 40-character commit SHA that health-url must report
+        type: string
+        required: true
+      environment:
+        description: GitHub environment that holds RENDER_DEPLOY_HOOK. Limit it to main
+        type: string
+        required: true
+    secrets:
+      RENDER_DEPLOY_HOOK:
+        description: The service's deploy hook URL, stored as an environment secret
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Up to 30 polls, each up to 20 seconds of curl and 10 of sleep, plus the hook call.
+    timeout-minutes: 20
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Check the deploy hook secret
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          # >>> check-secret
+          set -euo pipefail
+          # GitHub resolves a missing secret to an empty string, and required: true
+          # does not prove it has a value. The hook URL is never printed: none of
+          # these messages includes it, and this block must never use set -x.
+          if [ -z "$RENDER_DEPLOY_HOOK" ]; then
+            echo "::error::RENDER_DEPLOY_HOOK is empty. Add it to this environment and pass it by name"
+            exit 1
+          fi
+          # Checked before masking, because a value with a line break would not mask whole.
+          urlre='^(https://[A-Za-z0-9.-]+|http://127\.0\.0\.1:[0-9]+)/[A-Za-z0-9._~/-]*(\?[A-Za-z0-9._~%&=+-]*)?$'
+          if ! [[ $RENDER_DEPLOY_HOOK =~ $urlre ]]; then
+            echo "::error::RENDER_DEPLOY_HOOK is not a valid https URL (value not shown)"
+            exit 1
+          fi
+          echo "::add-mask::$RENDER_DEPLOY_HOOK"
+          # The request URL has imgURL added, so the whole-URL mask would not match it.
+          case "$RENDER_DEPLOY_HOOK" in
+            *key=*)
+              key=${RENDER_DEPLOY_HOOK##*key=}
+              key=${key%%&*}
+              if [ -n "$key" ]; then echo "::add-mask::$key"; fi
+              ;;
+          esac
+          case "$RENDER_DEPLOY_HOOK" in
+            *[?\&]imgURL=*)
+              echo "::error::RENDER_DEPLOY_HOOK already sets imgURL, so this deploy could not choose the image (value not shown)"
+              exit 1
+              ;;
+          esac
+          # <<< check-secret
+
+      - name: Validate inputs
+        env:
+          IN_ENVIRONMENT: ${{ inputs.environment }}
+          IMAGE_DIGEST: ${{ inputs.image-digest }}
+          HEALTH_URL: ${{ inputs.health-url }}
+          EXPECTED_VERSION: ${{ inputs.expected-version }}
+        run: |
+          # >>> validate
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          # Without an environment the job would not get the main-only environment's secret.
+          [[ $IN_ENVIRONMENT =~ ^[A-Za-z0-9._-]+$ ]] || fail "environment must name a GitHub environment"
+          part='[a-z0-9]+([._-][a-z0-9]+)*'
+          imgre="^[a-z0-9]+([.-][a-z0-9]+)*\.[a-z]{2,}(:[0-9]+)?(/$part)+@sha256:[0-9a-f]{64}\$"
+          [[ $IMAGE_DIGEST =~ $imgre ]] || fail "image-digest must be registry/name@sha256:<64 lower-case hex>"
+          urlre='^(https://[A-Za-z0-9.-]+|http://127\.0\.0\.1:[0-9]+)(/[A-Za-z0-9._~/-]*)?(\?[A-Za-z0-9._~%&=+-]*)?$'
+          [[ $HEALTH_URL =~ $urlre ]] || fail "health-url must be an https URL"
+          # A full SHA, so the substring match on the health body cannot pass on an empty or short value.
+          [[ $EXPECTED_VERSION =~ ^[0-9a-f]{40}$ ]] || fail "expected-version must be a full 40-character commit SHA"
+          echo "inputs OK"
+          # <<< validate
+
+      - name: Call the deploy hook
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+          IMAGE_DIGEST: ${{ inputs.image-digest }}
+        run: |
+          # >>> trigger
+          set -euo pipefail
+          # The validated image holds only [a-z0-9._-], / : and @, so these cover it.
+          encoded=${IMAGE_DIGEST//\//%2F}
+          encoded=${encoded//@/%40}
+          encoded=${encoded//:/%3A}
+          case "$RENDER_DEPLOY_HOOK" in *\?*) sep='&' ;; *) sep='?' ;; esac
+          body=$(mktemp)
+          trap 'rm -f "$body"' EXIT
+          # The URL goes to curl on stdin, so it is not in the process list. --silent
+          # without --show-error drops curl's messages, and only its exit code is
+          # reported. The response body is not printed. No --retry, because a
+          # repeat could start a second deploy. Redirects are not followed.
+          rc=0
+          code=$(printf 'url = "%s%simgURL=%s"\n' "$RENDER_DEPLOY_HOOK" "$sep" "$encoded" \
+            | curl --config - --silent --request POST --max-time 30 --output "$body" --write-out '%{http_code}') || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::could not complete the deploy hook call (curl exit code $rc). A deploy may or may not have started"
+            exit 1
+          fi
+          case "$code" in
+            200)
+              deploy_id=$(grep -oE 'dep-[a-z0-9]+' "$body" | head -n 1 || true)
+              echo "Render started deploy ${deploy_id:-(no id in the response)} of $IMAGE_DIGEST"
+              ;;
+            202)
+              echo "::error::Render returned 202: another deploy of this service is in progress. Render queued this request and may run it after that one, but this run can't confirm it. Check the service's Deploys page, then re-run this job if needed"
+              exit 1
+              ;;
+            *)
+              echo "::error::Render deploy hook returned HTTP $code. 400 or 404 can mean imgURL was rejected (only the digest may differ from the service's image URL), 401 a regenerated hook, 409 a suspended service"
+              exit 1
+              ;;
+          esac
+          # <<< trigger
+
+      - name: Wait for the new version
+        env:
+          HEALTH_URL: ${{ inputs.health-url }}
+          EXPECTED_VERSION: ${{ inputs.expected-version }}
+        run: |
+          # >>> poll
+          set -euo pipefail
+          attempts=${POLL_ATTEMPTS:-30}
+          delay=${POLL_DELAY:-10}
+          [[ $attempts =~ ^[1-9][0-9]*$ ]] || { echo "::error::POLL_ATTEMPTS must be a positive whole number"; exit 1; }
+          [[ $delay =~ ^[0-9]+$ ]] || { echo "::error::POLL_DELAY must be a whole number"; exit 1; }
+          echo "polling $HEALTH_URL: up to $attempts attempts, $delay seconds apart"
+          for attempt in $(seq 1 "$attempts"); do
+            body="$(curl -fsS --max-time 20 "$HEALTH_URL" || true)"
+            case "$body" in
+              *"$EXPECTED_VERSION"*)
+                echo "$HEALTH_URL reports $EXPECTED_VERSION (attempt $attempt, $SECONDS seconds)"
+                exit 0
+                ;;
+            esac
+            sleep "$delay"
+          done
+          echo "::error::$HEALTH_URL did not report $EXPECTED_VERSION after $attempts attempts ($SECONDS seconds)"
+          exit 1
+          # <<< poll

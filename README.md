@@ -13,6 +13,7 @@ Shared GitHub Actions workflows for my projects. Public so any repo can call the
 | `python-ci.yml` | Install (uv or pip), ruff, mypy and pytest. See [python-ci](#python-ci). |
 | `java-ci.yml` | Maven build and tests on a Temurin JDK. See [java-ci](#java-ci). |
 | `terraform-validate.yml` | `fmt -check`, `init -backend=false` and `validate`. See [terraform-validate](#terraform-validate). |
+| `deploy-render.yml` | Deploy an image to Render by digest, then wait for its health URL to report the new commit. See [deploy-render](#deploy-render). |
 | `scorecard.yml` | OpenSSF Scorecard for this repo. Weekly and manual. Informational, not a gate. |
 | `self-test.yml` | Tests this repo. Also proves the tools fail on planted bad input. |
 
@@ -254,6 +255,62 @@ jobs:
 ```
 
 Add each job to `ci-ok`'s `needs`.
+
+## deploy-render
+
+Steps: check the secret, validate inputs, call the Render deploy hook with the
+image digest, then poll the health URL until it reports the new commit.
+
+| Input | Meaning |
+|---|---|
+| `image-digest` | `registry/name@sha256:<64 hex>`. Use `docker-build`'s `image` output |
+| `health-url` | `https` URL whose response body contains the deployed commit |
+| `expected-version` | Full 40-character commit SHA, normally `github.sha` |
+| `environment` | GitHub environment holding the secret. Limit it to `main` |
+
+All four are required. The secret is `RENDER_DEPLOY_HOOK`, stored in that
+environment and passed by name, never with `secrets: inherit`. The job that
+calls this workflow can't use `environment` itself; this workflow sets it.
+
+```yaml
+jobs:
+  deploy:
+    needs: [ci-ok, image]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: abhiman-erla/ci-templates/.github/workflows/deploy-render.yml@<sha> # v1.4.0
+    with:
+      image-digest: ${{ needs.image.outputs.image }}
+      health-url: https://my-service.onrender.com/health
+      expected-version: ${{ github.sha }}
+      environment: production
+    secrets:
+      RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+```
+
+How it behaves:
+
+- GitHub resolves a missing secret to an empty string, so the first step fails
+  if it's empty. Every bad secret or input fails before any network call.
+- The hook URL is a secret. It's masked, passed to `curl` on stdin rather than
+  as an argument, and never printed. Hook errors report only the status or
+  `curl`'s exit code. Don't add `set -x` to this workflow.
+- Only a 200 from the hook counts as started. A 202 means another deploy is in
+  progress and fails with its own message, though Render may still run the
+  queued deploy later. Anything else fails, and the call is never retried,
+  because a repeat could start a second deploy.
+- The poll makes up to 30 attempts, 10 seconds apart, about 5 minutes if the
+  health URL answers quickly. Each request can take up to 20 seconds, so a
+  hanging service can take up to 15 minutes. An old version keeps answering
+  during a deploy, so only the new commit's SHA in the body passes.
+- A failure here doesn't stop Render. Once the hook has fired, the deploy carries on.
+- `imgURL` may differ from the service's image URL only in the digest, or
+  Render rejects it. The service must already use the same `registry/name`.
+
+`self-test.yml` runs the blocks extracted from this workflow against
+`fixtures/fake-render`, a local fake of the hook and health URL. To run them
+yourself: `bash fixtures/fake-render/cases.sh`. The poll count and delay read
+`POLL_ATTEMPTS` and `POLL_DELAY` so the test can shorten them. They aren't
+inputs, and the test fails if the workflow ever sets them.
 
 ## Do the gates really trip?
 
