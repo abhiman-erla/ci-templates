@@ -122,7 +122,7 @@ jobs:
           echo "OK: control scan is clean"
 
           # Fake token, generated now and never committed or reused.
-          suffix=$(openssl rand -base64 96 | tr -dc 'A-Za-z0-9' | head -c 36)
+          suffix=$(openssl rand -hex 18)
           [ "${#suffix}" -eq 36 ]
           printf 'github_token = "ghp_%s"\n' "$suffix" > "$d/config.txt"
 
