@@ -5,8 +5,8 @@ name: deploy-render
 # old version keeps answering during a deploy, so a 200 alone proves nothing.
 #
 # self-test.yml extracts the marked blocks below and runs them against a local
-# fake server, because it cannot call Render. The poll count and delay read
-# POLL_ATTEMPTS and POLL_DELAY so it can shorten them. They are deliberately not
+# fake server, because it cannot call Render. The poll reads POLL_ATTEMPTS,
+# POLL_DELAY and POLL_DEADLINE so it can shorten them. They are deliberately not
 # inputs and no step here sets them, so a real deploy always uses the defaults.
 on:
   workflow_call:
@@ -38,8 +38,8 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    # Up to 30 polls, each up to 20 seconds of curl and 10 of sleep, plus the hook call.
-    timeout-minutes: 20
+    # The poll stops itself at 5 minutes. This also covers the hook call and the runner.
+    timeout-minutes: 7
     environment: ${{ inputs.environment }}
     steps:
       - name: Check the deploy hook secret
@@ -148,21 +148,32 @@ jobs:
         run: |
           # >>> poll
           set -euo pipefail
+          # Checked here too: an empty value would match every body in the case below.
+          [[ $EXPECTED_VERSION =~ ^[0-9a-f]{40}$ ]] || { echo "::error::expected-version must be a full 40-character commit SHA"; exit 1; }
           attempts=${POLL_ATTEMPTS:-30}
           delay=${POLL_DELAY:-10}
+          deadline=${POLL_DEADLINE:-300}
           [[ $attempts =~ ^[1-9][0-9]*$ ]] || { echo "::error::POLL_ATTEMPTS must be a positive whole number"; exit 1; }
           [[ $delay =~ ^[0-9]+$ ]] || { echo "::error::POLL_DELAY must be a whole number"; exit 1; }
-          echo "polling $HEALTH_URL: up to $attempts attempts, $delay seconds apart"
-          for attempt in $(seq 1 "$attempts"); do
-            body="$(curl -fsS --max-time 20 "$HEALTH_URL" || true)"
+          [[ $deadline =~ ^[1-9][0-9]*$ ]] || { echo "::error::POLL_DEADLINE must be a positive whole number"; exit 1; }
+          echo "polling $HEALTH_URL: up to $attempts attempts, $delay seconds apart, $deadline seconds at most"
+          attempt=0
+          while [ "$attempt" -lt "$attempts" ] && [ "$SECONDS" -lt "$deadline" ]; do
+            attempt=$((attempt + 1))
+            # Neither the request nor the sleep may run past the deadline.
+            limit=$((deadline - SECONDS))
+            if [ "$limit" -gt 20 ]; then limit=20; fi
+            body="$(curl -fsS --max-time "$limit" "$HEALTH_URL" || true)"
             case "$body" in
               *"$EXPECTED_VERSION"*)
                 echo "$HEALTH_URL reports $EXPECTED_VERSION (attempt $attempt, $SECONDS seconds)"
                 exit 0
                 ;;
             esac
-            sleep "$delay"
+            pause=$((deadline - SECONDS))
+            if [ "$pause" -gt "$delay" ]; then pause=$delay; fi
+            if [ "$pause" -gt 0 ]; then sleep "$pause"; fi
           done
-          echo "::error::$HEALTH_URL did not report $EXPECTED_VERSION after $attempts attempts ($SECONDS seconds)"
+          echo "::error::$HEALTH_URL did not report $EXPECTED_VERSION within 5 minutes ($attempt attempts, $SECONDS seconds)"
           exit 1
           # <<< poll

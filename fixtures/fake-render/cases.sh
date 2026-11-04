@@ -25,8 +25,9 @@ order=$(sed -nE 's/^ *# >>> ([a-z-]+)$/\1/p' "$wf" | paste -sd ' ' -)
 grep -qF "environment: \${{ inputs.environment }}" "$wf" || structure_fail "job has no environment"
 grep -qF "attempts=\${POLL_ATTEMPTS:-30}" "$wf" || structure_fail "default attempts changed"
 grep -qF "delay=\${POLL_DELAY:-10}" "$wf" || structure_fail "default delay changed"
+grep -qF "deadline=\${POLL_DEADLINE:-300}" "$wf" || structure_fail "default deadline changed"
 # The poll settings stay internal: nothing in the workflow may set them.
-if grep -Eq '^ *POLL_(ATTEMPTS|DELAY):' "$wf"; then structure_fail "workflow sets a poll override"; fi
+if grep -Eq '^ *POLL_(ATTEMPTS|DELAY|DEADLINE):' "$wf"; then structure_fail "workflow sets a poll override"; fi
 if grep -Eq '^ *set -[a-z]*x' "$wf"; then structure_fail "set -x would print the hook URL"; fi
 echo "ok   workflow structure"
 
@@ -183,7 +184,7 @@ check "hook unreachable" bad 'curl exit code'
 export POLL_ATTEMPTS=3 POLL_DELAY=0
 start_server
 reset_values
-check "server never reports the version" bad "did not report $new after 3 attempts"
+check "server never reports the version" bad "did not report $new within 5 minutes \(3 attempts"
 if [ "$(grep -c '^GET /health' "$log")" -ne 3 ]; then
   echo "::error::expected exactly 3 polls"
   fails=1
@@ -193,6 +194,43 @@ stop_server
 start_server REPORT_AFTER=0 HEALTH_STATUS=500
 reset_values
 check "version only in a 500 answer" bad "did not report $new"
+stop_server
+
+# A server that hangs: the deadline must stop the request itself, not just the loop.
+export POLL_ATTEMPTS=30 POLL_DELAY=1 POLL_DEADLINE=2
+start_server HEALTH_HANG=1
+reset_values
+started=$SECONDS
+check "server hangs until the deadline" bad "did not report $new within 5 minutes"
+if [ $((SECONDS - started)) -gt 8 ]; then
+  echo "::error::a hanging server held the poll past its deadline ($((SECONDS - started)) seconds)"
+  fails=1
+fi
+stop_server
+
+# A server that answers: the deadline stops the loop before the attempts run out.
+start_server
+reset_values
+check "deadline ends polling before the attempts run out" bad "within 5 minutes \([1-9] attempts"
+stop_server
+unset POLL_DEADLINE
+
+# The poll block on its own refuses a bad version, so that a null expression
+# can't match every body even if the validate step is ever bypassed.
+poll_refuses() { # label value
+  local rc=0 out
+  out=$(HEALTH_URL="http://127.0.0.1:$port/health" EXPECTED_VERSION=$2 bash "$tmp/poll.sh" 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ] && grep -q 'expected-version must be' <<<"$out"; then
+    echo "ok   poll block refuses $1"
+  else
+    echo "::error::poll block accepted $1 (rc=$rc)"
+    fails=1
+  fi
+  no_network "poll block with $1"
+}
+start_server REPORT_AFTER=0
+poll_refuses "an empty version" ""
+poll_refuses "a short version" "2222"
 stop_server
 
 export POLL_ATTEMPTS=5 POLL_DELAY=1
@@ -230,13 +268,14 @@ stop_server
 unset POLL_ATTEMPTS POLL_DELAY
 start_server REPORT_AFTER=0
 reset_values
-check "default poll settings" ok "up to 30 attempts, 10 seconds apart"
+check "default poll settings" ok "up to 30 attempts, 10 seconds apart, 300 seconds at most"
 stop_server
 
 # A bad override is refused rather than treated as no polling.
 start_server REPORT_AFTER=0
 reset_values
 POLL_ATTEMPTS=0 check "POLL_ATTEMPTS of 0" bad 'POLL_ATTEMPTS must be'
+POLL_DEADLINE=0 check "POLL_DEADLINE of 0" bad 'POLL_DEADLINE must be'
 stop_server
 
 if [ "$fails" -ne 0 ]; then

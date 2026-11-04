@@ -298,18 +298,17 @@ How it behaves:
   progress and fails with its own message, though Render may still run the
   queued deploy later. Anything else fails, and the call is never retried,
   because a repeat could start a second deploy.
-- The poll makes up to 30 attempts, 10 seconds apart, about 5 minutes if the
-  health URL answers quickly. Each request can take up to 20 seconds, so a
-  hanging service can take up to 15 minutes. An old version keeps answering
-  during a deploy, so only the new commit's SHA in the body passes.
+- The poll makes up to 30 attempts, 10 seconds apart, and stops at 5 minutes
+  whatever happens, including a service that hangs. An old version keeps
+  answering during a deploy, so only the new commit's SHA in the body passes.
 - A failure here doesn't stop Render. Once the hook has fired, the deploy carries on.
 - `imgURL` may differ from the service's image URL only in the digest, or
   Render rejects it. The service must already use the same `registry/name`.
 
 `self-test.yml` runs the blocks extracted from this workflow against
 `fixtures/fake-render`, a local fake of the hook and health URL. To run them
-yourself: `bash fixtures/fake-render/cases.sh`. The poll count and delay read
-`POLL_ATTEMPTS` and `POLL_DELAY` so the test can shorten them. They aren't
+yourself: `bash fixtures/fake-render/cases.sh`. The poll reads
+`POLL_ATTEMPTS`, `POLL_DELAY` and `POLL_DEADLINE` so the test can shorten them. They aren't
 inputs, and the test fails if the workflow ever sets them.
 
 ## Do the gates really trip?

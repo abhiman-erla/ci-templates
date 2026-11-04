@@ -5,6 +5,7 @@
 //   NEW_VERSION       version in /health after that
 //   REPORT_AFTER      requests answered with OLD_VERSION. Omit it to never report NEW_VERSION
 //   HEALTH_STATUS     status from /health (default 200)
+//   HEALTH_HANG       if set, /health never answers
 const fs = require('node:fs');
 const http = require('node:http');
 
@@ -16,6 +17,7 @@ const server = http.createServer((req, res) => {
   const path = req.url.split('?')[0];
   if (path === '/health') {
     healthRequests += 1;
+    if (env.HEALTH_HANG) return;
     const reported = env.REPORT_AFTER !== undefined && healthRequests > Number(env.REPORT_AFTER);
     res.writeHead(Number(env.HEALTH_STATUS || 200), { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', version: reported ? env.NEW_VERSION : env.OLD_VERSION }));
