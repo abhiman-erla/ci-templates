@@ -10,6 +10,9 @@ Shared GitHub Actions workflows for my projects. Public so any repo can call the
 | `workflow-lint.yml` | Runs actionlint and zizmor on the caller's `.github/workflows`. Optional input `path`. Fails on any finding. |
 | `node-ci.yml` | Install, lint, test and audit a Node project. See [node-ci](#node-ci). |
 | `docker-build.yml` | Build, boot-test, scan with Trivy and (on push to main) push an image to ghcr.io. See [docker-build](#docker-build). |
+| `python-ci.yml` | Install (uv or pip), ruff, mypy and pytest. See [python-ci](#python-ci). |
+| `java-ci.yml` | Maven build and tests on a Temurin JDK. See [java-ci](#java-ci). |
+| `terraform-validate.yml` | `fmt -check`, `init -backend=false` and `validate`. See [terraform-validate](#terraform-validate). |
 | `scorecard.yml` | OpenSSF Scorecard for this repo. Weekly and manual. Informational, not a gate. |
 | `self-test.yml` | Tests this repo. Also proves the tools fail on planted bad input. |
 
@@ -144,6 +147,90 @@ How it behaves:
 - Login uses the caller's `GITHUB_TOKEN`; it is passed through the
   environment and removed again with `docker logout`.
 
+## python-ci
+
+Steps: checkout, validate inputs, set up Python (pip) or uv, install, `ruff check .`,
+`ruff format --check .`, `mypy` (optional), `pytest`, upload `coverage.xml`.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `package-manager` | `uv` | `uv` or `pip`. Anything else fails the job |
+| `python-version` | `3.12` | `major.minor` or `major.minor.patch` |
+| `working-directory` | `.` | Project directory, relative to the repo root |
+| `mypy-path` | empty | Space-separated paths for `mypy`. Empty skips mypy |
+| `pytest-args` | empty | Extra arguments for `pytest` (see below) |
+| `artifact-name` | `python-coverage` | Name of the uploaded `coverage.xml`. Two calls in one workflow run need different names |
+
+No outputs.
+
+- **uv mode** runs `uv sync --locked --dev` (needs `pyproject.toml` and `uv.lock`; a stale lock fails).
+  The uv cache is keyed on `uv.lock`.
+- **pip mode** creates `.venv` and runs `pip install -r requirements.txt -r requirements-dev.txt`.
+  It fails if either file is missing. `requirements-dev.txt` must provide ruff, pytest
+  and, if you use them, mypy and pytest-cov. The pip cache is keyed on both files.
+- Both modes end with the project's `.venv/bin` on `PATH`, so the gates are the same.
+- `pytest-args` is trusted caller code. It is run as `bash -e -o pipefail -c "pytest $PYTEST_ARGS"`,
+  so bash parses it like a command line: `-k "test_a or test_b"` works and
+  a literal space needs quotes. It is passed through `env`, never interpolated into a script.
+  Add `--cov=src --cov-report=xml` yourself for coverage; a `coverage.xml` in the working
+  directory is uploaded (nothing is uploaded if there is none).
+- pytest exits 5 when it collects no tests. That fails the job and is not suppressed.
+
+## java-ci
+
+Steps: checkout, validate inputs, `actions/setup-java` (Temurin, Maven cache), run
+`maven-command`, upload Surefire and Failsafe reports if it failed.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `java-version` | `21` | Passed to `actions/setup-java` |
+| `maven-command` | `./mvnw -B verify` | Required, an empty value fails the job |
+| `working-directory` | `.` | Directory holding `pom.xml`, relative to the repo root. The Maven cache is keyed on that `pom.xml` |
+| `artifact-name` | `java-test-reports` | Name of the failure artifact. Two calls in one workflow run need different names |
+
+No outputs. `maven-command` is trusted caller code, run as
+`bash -e -o pipefail -c "$MAVEN_COMMAND"`: quotes and several lines work, and a failing
+early line is not hidden by a later one. Testcontainers works because the runner has Docker.
+
+## terraform-validate
+
+Steps: checkout, validate inputs, `hashicorp/setup-terraform` (wrapper off, so exit
+codes are the real ones), `terraform fmt -check -recursive -diff`,
+`terraform init -backend=false -input=false`, `terraform validate`.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `working-directory` | `.` | Directory with the configuration, relative to the repo root |
+| `terraform-version` | `1.9.8` | Exact version (`1.9.8`, or a prerelease like `1.10.0-rc1`). Ranges and `latest` fail |
+
+No outputs. No credentials, no backend and no plan: this is a syntax, format and
+reference check only. Providers are downloaded by `init`.
+
+## Calling the language workflows
+
+```yaml
+jobs:
+  python:
+    uses: abhiman-erla/ci-templates/.github/workflows/python-ci.yml@<sha> # v1.2.0
+    permissions:
+      contents: read
+    with:
+      mypy-path: src
+      pytest-args: --cov=src --cov-report=xml
+  java:
+    uses: abhiman-erla/ci-templates/.github/workflows/java-ci.yml@<sha> # v1.2.0
+    permissions:
+      contents: read
+  terraform:
+    uses: abhiman-erla/ci-templates/.github/workflows/terraform-validate.yml@<sha> # v1.2.0
+    permissions:
+      contents: read
+    with:
+      working-directory: infra
+```
+
+Add each job to `ci-ok`'s `needs`.
+
 ## Do the gates really trip?
 
 `self-test.yml` runs the audit and Trivy blocks, extracted from the workflows,
@@ -151,6 +238,14 @@ against known-bad input and requires failure: `npm audit` on a lockfile pinning
 `lodash@4.17.15`, and Trivy on a digest-pinned `alpine:3.10.0` image (it must
 print a CVE), plus an image with nothing to scan. The assertions on the
 `image` and `digest` outputs are unit-tested on sample values.
+
+The same is done for the new workflows, each on the text extracted from the
+workflow: ruff check, ruff format, mypy and pytest each fail on a planted defect
+(and pytest on zero collected tests, exit 5); Maven fails on a failing test, a
+missing `./mvnw` and a failing early line; Terraform `validate` fails on
+`fixtures/terraform-undeclared` (a reference to an undeclared resource) and `fmt`
+fails on a badly formatted file in a subdirectory. Their input validation is
+tested with good and bad values.
 
 ## Versioning
 

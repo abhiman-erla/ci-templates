@@ -1,0 +1,87 @@
+name: java-ci
+
+# Reusable. Sets up a JDK (Temurin) with the Maven cache and runs one Maven
+# command, by default `./mvnw -B verify`. maven-command is trusted caller code:
+# it runs as `bash -e -o pipefail -c "$MAVEN_COMMAND"`, so quotes and several
+# lines work, and it is never interpolated into a script. self-test.yml extracts
+# the marked blocks below and runs them against planted failures.
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: Java version for actions/setup-java (Temurin)
+        type: string
+        default: "21"
+      maven-command:
+        description: Command to run. Required, an empty value fails the job
+        type: string
+        default: ./mvnw -B verify
+      working-directory:
+        description: Directory with the pom.xml, relative to the repo root
+        type: string
+        default: .
+      artifact-name:
+        description: Name of the Surefire/Failsafe report artifact uploaded on failure. Use a distinct name per call in one workflow run
+        type: string
+        default: java-test-reports
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        env:
+          IN_VERSION: ${{ inputs.java-version }}
+          IN_COMMAND: ${{ inputs.maven-command }}
+          IN_WD: ${{ inputs.working-directory }}
+        run: |
+          # >>> validate
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          re_version='^[0-9]+([.][0-9]+){0,2}$'
+          re_dir='^[A-Za-z0-9_.][A-Za-z0-9_./-]*$'
+          [[ $IN_VERSION =~ $re_version ]] || fail "java-version must look like 21 or 21.0.4, got ${IN_VERSION@Q}"
+          [[ $IN_COMMAND =~ [^[:space:]] ]] || fail "maven-command is empty. Pass a command, for example './mvnw -B verify'"
+          [[ $IN_WD =~ $re_dir ]] || fail "working-directory has unsupported characters: ${IN_WD@Q}"
+          case "/$IN_WD/" in *"/../"*) fail "working-directory may not contain .." ;; esac
+          [ -d "$IN_WD" ] || fail "working-directory ${IN_WD@Q} is not a directory"
+          [ -f "$IN_WD/pom.xml" ] || fail "no pom.xml in ${IN_WD@Q}"
+          echo "inputs OK"
+          # <<< validate
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+          cache-dependency-path: ${{ inputs.working-directory }}/pom.xml
+
+      - name: Maven
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          MAVEN_COMMAND: ${{ inputs.maven-command }}
+        run: |
+          # >>> maven
+          bash -e -o pipefail -c "$MAVEN_COMMAND"
+          # <<< maven
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: |
+            ${{ inputs.working-directory }}/**/target/surefire-reports/
+            ${{ inputs.working-directory }}/**/target/failsafe-reports/
+          if-no-files-found: ignore
+          retention-days: 14

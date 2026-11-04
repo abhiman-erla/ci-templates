@@ -1,0 +1,160 @@
+name: python-ci
+
+# Reusable. Installs a Python project (uv or pip), then runs ruff check,
+# ruff format --check, mypy (optional) and pytest. Inputs reach the shell
+# through env only, never interpolated into a script. pytest-args is trusted
+# caller code. self-test.yml extracts the marked blocks below and runs them
+# against planted defects, so what is tested is the shipped text.
+on:
+  workflow_call:
+    inputs:
+      package-manager:
+        description: uv or pip. Anything else fails the job
+        type: string
+        default: uv
+      python-version:
+        description: Python version, major.minor or major.minor.patch
+        type: string
+        default: "3.12"
+      working-directory:
+        description: Directory of the Python project, relative to the repo root
+        type: string
+        default: .
+      mypy-path:
+        description: Space-separated paths passed to mypy. Empty skips mypy
+        type: string
+        default: ""
+      pytest-args:
+        description: Extra pytest arguments, parsed by bash like a command line (quotes work). Trusted caller code
+        type: string
+        default: ""
+      artifact-name:
+        description: Name of the uploaded coverage.xml artifact. Use a distinct name per call in one workflow run
+        type: string
+        default: python-coverage
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        env:
+          IN_PM: ${{ inputs.package-manager }}
+          IN_VERSION: ${{ inputs.python-version }}
+          IN_WD: ${{ inputs.working-directory }}
+          IN_MYPY: ${{ inputs.mypy-path }}
+        run: |
+          # >>> validate
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          case "$IN_PM" in
+            uv|pip) ;;
+            *) fail "package-manager must be uv or pip, got ${IN_PM@Q}" ;;
+          esac
+          re_version='^[0-9]+(\.[0-9]+){1,2}$'
+          re_dir='^[A-Za-z0-9_.][A-Za-z0-9_./-]*$'
+          re_paths='^[A-Za-z0-9_.][A-Za-z0-9_./ -]*$'
+          [[ $IN_VERSION =~ $re_version ]] || fail "python-version must look like 3.12 or 3.12.4, got ${IN_VERSION@Q}"
+          [[ $IN_WD =~ $re_dir ]] || fail "working-directory has unsupported characters: ${IN_WD@Q}"
+          case "/$IN_WD/" in *"/../"*) fail "working-directory may not contain .." ;; esac
+          [ -d "$IN_WD" ] || fail "working-directory ${IN_WD@Q} is not a directory"
+          if [ -n "$IN_MYPY" ]; then
+            [[ $IN_MYPY =~ $re_paths ]] || fail "mypy-path has unsupported characters: ${IN_MYPY@Q}"
+          fi
+          if [ "$IN_PM" = pip ]; then
+            [ -f "$IN_WD/requirements.txt" ] || fail "pip mode needs requirements.txt in ${IN_WD@Q}"
+            [ -f "$IN_WD/requirements-dev.txt" ] || fail "pip mode needs requirements-dev.txt in ${IN_WD@Q} (it provides ruff, mypy and pytest)"
+          fi
+          echo "inputs OK"
+          # <<< validate
+
+      - name: Set up Python (pip)
+        if: inputs.package-manager == 'pip'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            ${{ inputs.working-directory }}/requirements.txt
+            ${{ inputs.working-directory }}/requirements-dev.txt
+
+      - name: Set up uv
+        if: inputs.package-manager == 'uv'
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          working-directory: ${{ inputs.working-directory }}
+          enable-cache: true
+          cache-dependency-glob: ${{ inputs.working-directory }}/uv.lock
+
+      - name: Install (uv)
+        if: inputs.package-manager == 'uv'
+        working-directory: ${{ inputs.working-directory }}
+        run: uv sync --locked --dev
+
+      - name: Install (pip)
+        if: inputs.package-manager == 'pip'
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --disable-pip-version-check -r requirements.txt -r requirements-dev.txt
+
+      # Both modes end with the project's tools in ./.venv, so the gates below
+      # are identical.
+      - name: Put the project environment on PATH
+        working-directory: ${{ inputs.working-directory }}
+        run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: ruff check
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          # >>> ruff-check
+          ruff check .
+          # <<< ruff-check
+
+      - name: ruff format --check
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          # >>> ruff-format
+          ruff format --check .
+          # <<< ruff-format
+
+      - name: mypy
+        if: inputs.mypy-path != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          MYPY_PATH_ARGS: ${{ inputs.mypy-path }}
+        run: |
+          # >>> mypy
+          read -ra paths <<< "$MYPY_PATH_ARGS"
+          mypy "${paths[@]}"
+          # <<< mypy
+
+      # An exit code of 5 (no tests collected) fails the job on purpose.
+      - name: pytest
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PYTEST_ARGS: ${{ inputs.pytest-args }}
+        run: |
+          # >>> pytest
+          bash -e -o pipefail -c "pytest $PYTEST_ARGS"
+          # <<< pytest
+
+      - name: Upload coverage.xml
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.working-directory }}/coverage.xml
+          if-no-files-found: ignore
+          retention-days: 14

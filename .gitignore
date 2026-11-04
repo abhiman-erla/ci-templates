@@ -1,0 +1,10 @@
+# Build output from running the fixtures locally
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+target/
+.terraform/

@@ -28,6 +28,7 @@ env:
   GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
   TRIVY_VERSION: "0.69.3"
   TRIVY_IMAGE_DIGEST: sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c
+  TERRAFORM_VERSION: "1.9.8"
 
 jobs:
   secret-scan:
@@ -584,6 +585,311 @@ jobs:
           grep -q 'github-pat' <<<"$out" || { echo "::error::expected a github-pat finding (exit $rc)"; exit 1; }
           echo "OK: gitleaks rejected the planted token (exit $rc)"
 
+  python-ci-uv:
+    uses: ./.github/workflows/python-ci.yml
+    permissions:
+      contents: read
+    with:
+      working-directory: fixtures/python-app
+      mypy-path: src
+      # Quoted -k expression: proves pytest-args is parsed like a command line.
+      pytest-args: '-k "test_add or test_sub" --cov=src --cov-report=xml'
+      artifact-name: python-coverage-uv
+
+  python-ci-pip:
+    uses: ./.github/workflows/python-ci.yml
+    permissions:
+      contents: read
+    with:
+      package-manager: pip
+      working-directory: fixtures/python-app
+      mypy-path: src
+      pytest-args: '-k "test_add or test_sub" --cov=src --cov-report=xml'
+      artifact-name: python-coverage-pip
+
+  java-ci:
+    uses: ./.github/workflows/java-ci.yml
+    permissions:
+      contents: read
+    with:
+      working-directory: fixtures/java-app
+      maven-command: mvn -B verify
+      artifact-name: java-test-reports-fixture
+
+  terraform-validate:
+    uses: ./.github/workflows/terraform-validate.yml
+    permissions:
+      contents: read
+    with:
+      working-directory: fixtures/terraform
+
+  # Input validation blocks are extracted from the workflows and fed good and
+  # bad inputs. A reusable call that fails would fail this whole run, so the
+  # rejections are proved on the extracted text.
+  input-validation-cases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: python-ci validate block
+        run: |
+          set -euo pipefail
+          sed -n '/# >>> validate$/,/# <<< validate$/p' .github/workflows/python-ci.yml | sed '1d;$d' > "$RUNNER_TEMP/v.sh"
+          [ -s "$RUNNER_TEMP/v.sh" ] || { echo "::error::validate block not found"; exit 1; }
+          t="$RUNNER_TEMP/tree"
+          mkdir -p "$t/ok" "$t/pipok" "$t/pipdev" "$t/pipreq"
+          touch "$t/pipok/requirements.txt" "$t/pipok/requirements-dev.txt" "$t/pipdev/requirements-dev.txt" "$t/pipreq/requirements.txt"
+          fails=0
+          want() { # label ok|bad pm version wd mypy
+            local rc=0
+            (cd "$t" && IN_PM=$3 IN_VERSION=$4 IN_WD=$5 IN_MYPY=$6 bash "$RUNNER_TEMP/v.sh") > /dev/null 2>&1 || rc=$?
+            if { [ "$2" = ok ] && [ "$rc" -eq 0 ]; } || { [ "$2" = bad ] && [ "$rc" -ne 0 ]; }; then echo "ok   $1"
+            else echo "::error::$1 (expected $2, rc=$rc)"; fails=1; fi
+          }
+          want "uv, defaults" ok uv 3.12 ok ""
+          want "uv, patch version and mypy path" ok uv 3.12.4 ok src
+          want "uv, two mypy paths" ok uv 3.13 ok "src tests"
+          want "pip with both requirements files" ok pip 3.12 pipok src
+          want "package manager poetry" bad poetry 3.12 ok ""
+          want "package manager empty" bad "" 3.12 ok ""
+          want "package manager upper case" bad UV 3.12 ok ""
+          want "package manager with a command" bad "uv; id" 3.12 ok ""
+          want "version without minor" bad uv 3 ok ""
+          want "version 3.x" bad uv 3.x ok ""
+          want "version with a command" bad uv '3.12;id' ok ""
+          want "missing directory" bad uv 3.12 nope ""
+          want "directory escape" bad uv 3.12 ../ok ""
+          want "directory escape inside" bad uv 3.12 ok/../ok ""
+          want "directory starting with dash" bad uv 3.12 -x ""
+          want "absolute directory" bad uv 3.12 /tmp ""
+          want "directory with command substitution" bad uv 3.12 "ok$(id)" ""
+          want "mypy path starting with dash" bad uv 3.12 ok -x
+          want "mypy path with a semicolon" bad uv 3.12 ok 'src;id'
+          want "pip without requirements.txt" bad pip 3.12 pipdev ""
+          want "pip without requirements-dev.txt" bad pip 3.12 pipreq ""
+          want "pip with neither" bad pip 3.12 ok ""
+          exit "$fails"
+
+      - name: java-ci validate block
+        run: |
+          set -euo pipefail
+          sed -n '/# >>> validate$/,/# <<< validate$/p' .github/workflows/java-ci.yml | sed '1d;$d' > "$RUNNER_TEMP/j.sh"
+          [ -s "$RUNNER_TEMP/j.sh" ] || { echo "::error::validate block not found"; exit 1; }
+          t="$RUNNER_TEMP/jtree"
+          mkdir -p "$t/ok" "$t/nopom"
+          touch "$t/ok/pom.xml"
+          fails=0
+          want() { # label ok|bad version command wd
+            local rc=0
+            (cd "$t" && IN_VERSION=$3 IN_COMMAND=$4 IN_WD=$5 bash "$RUNNER_TEMP/j.sh") > /dev/null 2>&1 || rc=$?
+            if { [ "$2" = ok ] && [ "$rc" -eq 0 ]; } || { [ "$2" = bad ] && [ "$rc" -ne 0 ]; }; then echo "ok   $1"
+            else echo "::error::$1 (expected $2, rc=$rc)"; fails=1; fi
+          }
+          want "defaults" ok 21 './mvnw -B verify' ok
+          want "quoted multi-line command" ok 17 $'mvn -B -Dfoo="a b" verify\nmvn -B site' ok
+          want "empty command" bad 21 "" ok
+          want "blank command" bad 21 $'  \n ' ok
+          want "version with a command" bad '21;id' 'mvn verify' ok
+          want "version empty" bad "" 'mvn verify' ok
+          want "missing directory" bad 21 'mvn verify' nope
+          want "directory escape" bad 21 'mvn verify' ../ok
+          want "no pom.xml" bad 21 'mvn verify' nopom
+          exit "$fails"
+
+      - name: terraform-validate validate block
+        run: |
+          set -euo pipefail
+          sed -n '/# >>> validate$/,/# <<< validate$/p' .github/workflows/terraform-validate.yml | sed '1d;$d' > "$RUNNER_TEMP/t.sh"
+          [ -s "$RUNNER_TEMP/t.sh" ] || { echo "::error::validate block not found"; exit 1; }
+          t="$RUNNER_TEMP/ttree"
+          mkdir -p "$t/ok"
+          fails=0
+          want() { # label ok|bad version wd
+            local rc=0
+            (cd "$t" && IN_VERSION=$3 IN_WD=$4 bash "$RUNNER_TEMP/t.sh") > /dev/null 2>&1 || rc=$?
+            if { [ "$2" = ok ] && [ "$rc" -eq 0 ]; } || { [ "$2" = bad ] && [ "$rc" -ne 0 ]; }; then echo "ok   $1"
+            else echo "::error::$1 (expected $2, rc=$rc)"; fails=1; fi
+          }
+          want "defaults" ok 1.9.8 ok
+          want "prerelease version" ok 1.10.0-rc1 ok
+          want "latest is not a version" bad latest ok
+          want "range is not a version" bad '>= 1.9' ok
+          want "version without patch" bad 1.9 ok
+          want "version with a command" bad '1.9.8;id' ok
+          want "missing directory" bad 1.9.8 nope
+          want "directory escape" bad 1.9.8 ../ok
+          want "directory with command substitution" bad 1.9.8 "ok$(id)"
+          exit "$fails"
+
+  # The python gates are extracted from python-ci.yml and run against a copy of
+  # the fixture with one planted defect at a time. Each must fail for its own
+  # reason. pytest finding no tests (exit 5) must fail too.
+  python-gates-trip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.12"
+          enable-cache: false
+
+      - name: Extract the gates and install a scratch copy
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/blk"
+          for b in ruff-check ruff-format mypy pytest; do
+            sed -n "/# >>> $b\$/,/# <<< $b\$/p" .github/workflows/python-ci.yml | sed '1d;$d' > "$RUNNER_TEMP/blk/$b.sh"
+            [ -s "$RUNNER_TEMP/blk/$b.sh" ] || { echo "::error::block $b not found"; exit 1; }
+          done
+          cp -r fixtures/python-app "$RUNNER_TEMP/py"
+          (cd "$RUNNER_TEMP/py" && uv sync --locked --dev)
+          cat > "$RUNNER_TEMP/lib.sh" <<'LIB'
+          PY="$RUNNER_TEMP/py"
+          fails=0
+          LAST_RC=0
+          # gate <block> <ok|bad> <pattern the output must contain>
+          gate() {
+            local out rc=0
+            out=$(cd "$PY" && PATH="$PY/.venv/bin:$PATH" MYPY_PATH_ARGS=src bash -e -o pipefail "$RUNNER_TEMP/blk/$1.sh" 2>&1) || rc=$?
+            LAST_RC=$rc
+            if [ "$2" = ok ] && [ "$rc" -eq 0 ] && grep -q -- "$3" <<<"$out"; then echo "ok   $1 passes"
+            elif [ "$2" = bad ] && [ "$rc" -ne 0 ] && grep -q -- "$3" <<<"$out"; then echo "ok   $1 failed as planted (rc=$rc)"
+            else echo "::error::$1: expected $2 with '$3', rc=$rc"; echo "$out" | tail -15; fails=1; fi
+          }
+          LIB
+
+      - name: Clean fixture passes every gate
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/lib.sh"
+          gate ruff-check ok "All checks passed"
+          gate ruff-format ok "already formatted"
+          gate mypy ok "Success"
+          PYTEST_ARGS='-k "test_add or test_sub" -q' gate pytest ok "2 passed"
+          exit "$fails"
+
+      - name: Lint, format and type defects trip their gates
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/lib.sh"
+          printf 'import os\n' > "$PY/src/bad_lint.py"
+          gate ruff-check bad "F401"
+          rm "$PY/src/bad_lint.py"
+          printf 'x   =   1\n' > "$PY/src/bad_fmt.py"
+          gate ruff-format bad "reformat"
+          rm "$PY/src/bad_fmt.py"
+          printf 'def f() -> int:\n    return "x"\n' > "$PY/src/bad_type.py"
+          gate mypy bad "error:"
+          rm "$PY/src/bad_type.py"
+          exit "$fails"
+
+      - name: A failing test and zero collected tests trip pytest
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/lib.sh"
+          printf 'def test_bad() -> None:\n    assert 1 == 2\n' > "$PY/tests/test_bad.py"
+          gate pytest bad "1 failed"
+          rm "$PY/tests/test_bad.py"
+          PYTEST_ARGS='-k no_such_test' gate pytest bad "deselected"
+          if [ "$LAST_RC" -ne 5 ]; then echo "::error::expected pytest exit 5, got $LAST_RC"; fails=1; fi
+          exit "$fails"
+
+  java-gates-trip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Maven block fails on a failing test and on a bad command
+        run: |
+          set -euo pipefail
+          sed -n '/# >>> maven$/,/# <<< maven$/p' .github/workflows/java-ci.yml | sed '1d;$d' > "$RUNNER_TEMP/maven.sh"
+          [ -s "$RUNNER_TEMP/maven.sh" ] || { echo "::error::maven block not found"; exit 1; }
+          j="$RUNNER_TEMP/java"
+          cp -r fixtures/java-app "$j"
+          fails=0
+          # run <ok|bad> <pattern> <command>
+          run() {
+            local out rc=0
+            out=$(cd "$j" && MAVEN_COMMAND=$3 bash -e -o pipefail "$RUNNER_TEMP/maven.sh" 2>&1) || rc=$?
+            if [ "$1" = ok ] && [ "$rc" -eq 0 ] && grep -q -- "$2" <<<"$out"; then echo "ok   passes: $3"
+            elif [ "$1" = bad ] && [ "$rc" -ne 0 ] && grep -q -- "$2" <<<"$out"; then echo "ok   failed as planted (rc=$rc): $3"
+            else echo "::error::expected $1 with '$2' (rc=$rc): $3"; echo "$out" | tail -20; fails=1; fi
+          }
+          run ok "BUILD SUCCESS" "mvn -B verify"
+          mkdir -p "$j/src/test/java/fixture"
+          printf 'package fixture;\nimport static org.junit.jupiter.api.Assertions.assertEquals;\nimport org.junit.jupiter.api.Test;\nclass BadTest {\n    @Test\n    void wrong() { assertEquals(5, Calc.add(2, 2)); }\n}\n' > "$j/src/test/java/fixture/BadTest.java"
+          run bad "Tests run:.*Failures: 1" "mvn -B verify"
+          rm "$j/src/test/java/fixture/BadTest.java"
+          run bad "No such file" "./mvnw -B verify"
+          run bad "BUILD FAILURE" "mvn -B nonexistent-phase"
+          # An early failing line must not be hidden by a later passing one.
+          run bad "first" $'echo first\nfalse\ntrue'
+          exit "$fails"
+
+  terraform-gates-trip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: fmt, init and validate gates trip on planted defects
+        run: |
+          set -euo pipefail
+          for b in fmt init validate-config; do
+            sed -n "/# >>> $b\$/,/# <<< $b\$/p" .github/workflows/terraform-validate.yml | sed '1d;$d' > "$RUNNER_TEMP/$b.sh"
+            [ -s "$RUNNER_TEMP/$b.sh" ] || { echo "::error::block $b not found"; exit 1; }
+          done
+          fails=0
+          # gate <dir> <block> <ok|bad> <pattern>
+          gate() {
+            local out rc=0
+            out=$(cd "$1" && bash -e -o pipefail "$RUNNER_TEMP/$2.sh" 2>&1) || rc=$?
+            if [ "$3" = ok ] && [ "$rc" -eq 0 ]; then echo "ok   $2 passes in $1"
+            elif [ "$3" = bad ] && [ "$rc" -ne 0 ] && grep -q -- "$4" <<<"$out"; then echo "ok   $2 failed as planted in $1 (rc=$rc)"
+            else echo "::error::$2 in $1: expected $3 with '${4:-}', rc=$rc"; echo "$out" | tail -15; fails=1; fi
+          }
+          # Control: the clean fixture passes all three gates.
+          gate fixtures/terraform fmt ok
+          gate fixtures/terraform init ok
+          gate fixtures/terraform validate-config ok
+          # Planted: a reference to a resource that is never declared.
+          gate fixtures/terraform-undeclared fmt ok
+          gate fixtures/terraform-undeclared init ok
+          gate fixtures/terraform-undeclared validate-config bad "undeclared resource"
+          # Planted: badly formatted file in a subdirectory (-recursive must find it).
+          cp -r fixtures/terraform "$RUNNER_TEMP/tf"
+          mkdir "$RUNNER_TEMP/tf/sub"
+          printf 'variable "x" {\ntype=string\n}\n' > "$RUNNER_TEMP/tf/sub/bad.tf"
+          gate "$RUNNER_TEMP/tf" fmt bad "bad.tf"
+          rm -r "$RUNNER_TEMP/tf/sub"
+          # A configured backend must not matter: init -backend=false needs no credentials.
+          printf 'terraform {\n  backend "s3" {\n    bucket = "none"\n    key    = "none"\n    region = "us-east-1"\n  }\n}\n' > "$RUNNER_TEMP/tf/backend.tf"
+          gate "$RUNNER_TEMP/tf" fmt ok
+          gate "$RUNNER_TEMP/tf" init ok
+          exit "$fails"
+
   pins-match-reusable-workflows:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -625,6 +931,17 @@ jobs:
           else
             echo "ok change-helper identical in both workflows"
           fi
+          # Each third-party action must use exactly one SHA across all workflows.
+          for a in actions/checkout astral-sh/setup-uv actions/setup-python actions/setup-java actions/upload-artifact hashicorp/setup-terraform; do
+            n=$(grep -ohE "uses: $a@[0-9a-f]{40}" .github/workflows/*.yml | sort -u | wc -l)
+            if [ "$n" -ne 1 ]; then echo "::error::$a is pinned to $n different SHAs"; rc=1; else echo "ok $a has one pin"; fi
+          done
+          tf_default=$(sed -n '/^ *terraform-version:/,/default:/p' .github/workflows/terraform-validate.yml | sed -n 's/.*default: *"\([^"]*\)".*/\1/p')
+          if [ "$tf_default" != "$TERRAFORM_VERSION" ]; then
+            echo "::error::terraform-version default '$tf_default' differs from self-test TERRAFORM_VERSION '$TERRAFORM_VERSION'"; rc=1
+          else
+            echo "ok terraform-version default equals TERRAFORM_VERSION"
+          fi
           exit "$rc"
 
   ci-ok:
@@ -647,6 +964,14 @@ jobs:
       - actionlint-rejects-bad-workflow
       - zizmor-rejects-bad-workflow
       - gitleaks-rejects-planted-token
+      - python-ci-uv
+      - python-ci-pip
+      - java-ci
+      - terraform-validate
+      - input-validation-cases
+      - python-gates-trip
+      - java-gates-trip
+      - terraform-gates-trip
       - pins-match-reusable-workflows
     runs-on: ubuntu-latest
     steps:
