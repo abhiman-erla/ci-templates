@@ -34,6 +34,10 @@ on:
         description: Environment for the boot test container, one KEY=value per line
         type: string
         default: ""
+      smoke-postgres:
+        description: Start a throwaway postgres:16-alpine container named db (user, password and database all ci) on a private Docker network for the boot test, and attach the app to it. The caller passes the connection through smoke-env, for example DATABASE_URL=postgres://ci:ci@db:5432/ci
+        type: boolean
+        default: false
       push:
         description: Push the image on a push to main. false builds, tests and scans only (self-test uses this)
         type: boolean
@@ -64,6 +68,8 @@ jobs:
     env:
       TRIVY_VERSION: "0.69.3"
       TRIVY_IMAGE_DIGEST: sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c
+      # Index digest of postgres:16-alpine, used only when smoke-postgres is true.
+      POSTGRES_IMAGE_DIGEST: sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
       # Dependency and image-definition files: a change in any of them re-runs the scan.
       # The resolved `dockerfile` input is added to this at run time (Validate inputs).
       CHANGE_RE: '(^|/)([^/]*[Dd]ockerfile[^/]*|Containerfile[^/]*|\.dockerignore|package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|Pipfile\.lock|poetry\.lock|go\.mod|go\.sum|pom\.xml|Gemfile\.lock|Cargo\.lock)$'
@@ -132,6 +138,7 @@ jobs:
           SMOKE_PORT: ${{ inputs.smoke-port }}
           SMOKE_PATH: ${{ inputs.smoke-path }}
           SMOKE_ENV: ${{ inputs.smoke-env }}
+          SMOKE_POSTGRES: ${{ inputs.smoke-postgres }}
         run: |
           # >>> boot-test
           set -euo pipefail
@@ -147,8 +154,35 @@ jobs:
             fi
             args+=(-e "$line")
           done <<< "$SMOKE_ENV"
-          cid=$(docker run -d -p "127.0.0.1:${SMOKE_PORT}:${SMOKE_PORT}" "${args[@]}" "$IMAGE_REF")
-          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          cid=""
+          dbid=""
+          net=""
+          # Removes the app, the database and the network on every exit, including failures.
+          trap 'for c in "$cid" "$dbid"; do if [ -n "$c" ]; then docker rm -f "$c" >/dev/null 2>&1 || true; fi; done; if [ -n "$net" ]; then docker network rm "$net" >/dev/null 2>&1 || true; fi' EXIT
+          net_args=()
+          if [ "${SMOKE_POSTGRES:-false}" = "true" ]; then
+            # Throwaway database for the boot test only. Fixed dummy credentials ci/ci/ci.
+            net="smoke-$$"
+            docker network create "$net" >/dev/null
+            dbid=$(docker run -d --name db --network "$net" -e POSTGRES_USER=ci -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=ci "postgres:16-alpine@${POSTGRES_IMAGE_DIGEST}")
+            db_deadline=$((SECONDS + 60))
+            # pg_isready over TCP only succeeds once the real server is up, not the init-time one.
+            until docker exec "$dbid" pg_isready -q -h 127.0.0.1 -U ci -d ci; do
+              if [ "$(docker inspect -f '{{.State.Status}}' "$dbid")" != "running" ]; then
+                echo "::error::postgres sidecar exited"
+                docker logs "$dbid" || true
+                exit 1
+              fi
+              if [ "$SECONDS" -ge "$db_deadline" ]; then
+                echo "::error::postgres sidecar not ready within 60 seconds"
+                docker logs "$dbid" || true
+                exit 1
+              fi
+              sleep 1
+            done
+            net_args=(--network "$net")
+          fi
+          cid=$(docker run -d "${net_args[@]}" -p "127.0.0.1:${SMOKE_PORT}:${SMOKE_PORT}" "${args[@]}" "$IMAGE_REF")
           deadline=$((SECONDS + 30))
           while [ "$SECONDS" -lt "$deadline" ]; do
             state=$(docker inspect -f '{{.State.Status}}' "$cid")

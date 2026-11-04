@@ -97,6 +97,7 @@ Trivy scan, push.
 | `smoke-port` | `3000` | Port the app listens on inside the container |
 | `smoke-path` | `/` | Path polled for a 2xx status, for up to 30 seconds. Redirects (3xx) are not followed and do not count |
 | `smoke-env` | empty | Environment for the boot-test container, one `KEY=value` per line |
+| `smoke-postgres` | `false` | `true` starts a throwaway Postgres for the boot test. See [Boot test with a database](#boot-test-with-a-database) |
 | `push` | `true` | `false` builds, tests and scans but never pushes, even on main (this repo's self-test uses it so it never creates a package) |
 
 | Output | Meaning |
@@ -146,6 +147,29 @@ How it behaves:
   its vulnerability database on each run.
 - Login uses the caller's `GITHUB_TOKEN`; it is passed through the
   environment and removed again with `docker logout`.
+
+### Boot test with a database
+
+Some apps run a migration before they listen, so they never answer without a
+database. With `smoke-postgres: true` the boot test first creates a private
+Docker network and starts `postgres:16-alpine` (pinned by index digest) on it
+as a container named `db`, with user, password and database all `ci`. It waits
+(up to 60 seconds, over TCP) until Postgres accepts connections, then starts
+your image on the same network. Both containers and the network are removed
+when the step ends, pass or fail. The throwaway credentials protect nothing.
+Your image is not given any variables for it: pass the connection in `smoke-env`.
+
+```yaml
+    with:
+      smoke-postgres: true
+      smoke-env: |
+        DATABASE_URL=postgres://ci:ci@db:5432/ci
+```
+
+The default (`false`) changes nothing: no network, no extra container.
+`self-test.yml` runs a fixture (`fixtures/pg-app`) that exits unless it reaches
+`db:5432`; it must pass with the sidecar and fail without it, and the sidecar
+and network must be gone afterwards.
 
 ## python-ci
 

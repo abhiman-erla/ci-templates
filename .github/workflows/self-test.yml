@@ -29,6 +29,7 @@ env:
   TRIVY_VERSION: "0.69.3"
   TRIVY_IMAGE_DIGEST: sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c
   TERRAFORM_VERSION: "1.9.8"
+  POSTGRES_IMAGE_DIGEST: sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
 
 jobs:
   secret-scan:
@@ -78,6 +79,22 @@ jobs:
       smoke-path: /healthz
       smoke-env: |
         SMOKE_FLAG=on
+
+  # smoke-postgres: the fixture only answers /health if it can reach db:5432, so
+  # this passes only if the sidecar is started and the app is attached to it.
+  docker-build-postgres:
+    uses: ./.github/workflows/docker-build.yml
+    permissions:
+      contents: read
+      packages: write # ceiling for the called workflow; push is false
+    with:
+      context: fixtures/pg-app
+      image-name: ci-templates-fixture-pg
+      push: false
+      smoke-path: /health
+      smoke-postgres: true
+      smoke-env: |
+        DATABASE_URL=postgres://ci:ci@db:5432/ci
 
   # With push off, the outputs must be empty. The assertion block is shared with
   # output-assertions-unit, which proves it can fail.
@@ -330,6 +347,57 @@ jobs:
           if [ "$rc" -eq 0 ]; then echo "::error::boot test passed a crashing app"; exit 1; fi
           grep -q 'did not stay up' <<<"$out" || { echo "::error::expected the container-exited failure (exit $rc)"; exit 1; }
           echo "OK: boot test rejected the crashing app (exit $rc)"
+
+  # The same fixture must FAIL the boot test without the sidecar (extracted
+  # block, SMOKE_POSTGRES=false), and the sidecar and its network must be gone
+  # after a pass and after a failure.
+  postgres-sidecar-cases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the fixtures
+        run: |
+          docker build --tag pg-app:test fixtures/pg-app
+          docker build --tag crashing-app:test fixtures/crashing-app
+
+      - name: Sidecar on passes, off fails, nothing is left behind
+        run: |
+          set -euo pipefail
+          sed -n '/# >>> boot-test$/,/# <<< boot-test$/p' .github/workflows/docker-build.yml | sed '1d;$d' > "$RUNNER_TEMP/boot-test.sh"
+          [ -s "$RUNNER_TEMP/boot-test.sh" ] || { echo "::error::boot-test block not found"; exit 1; }
+          export SMOKE_PORT=3000 SMOKE_PATH=/health
+          boot() { IMAGE_REF=$1 SMOKE_POSTGRES=$2 SMOKE_ENV="DATABASE_URL=postgres://ci:ci@db:5432/ci" bash "$RUNNER_TEMP/boot-test.sh" 2>&1; }
+          clean() {
+            left=$(docker ps -aq --filter name='^db$' | wc -l)
+            nets=$(docker network ls -q --filter name='^smoke-' | wc -l)
+            if [ "$left" -ne 0 ] || [ "$nets" -ne 0 ]; then
+              echo "::error::leftover sidecar or network after: $1"
+              exit 1
+            fi
+            echo "OK: nothing left behind after $1"
+          }
+          boot pg-app:test true
+          clean "pass with sidecar"
+          set +e
+          out=$(boot pg-app:test false)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then echo "::error::fixture passed the boot test without the sidecar"; exit 1; fi
+          grep -q 'did not stay up' <<<"$out" || { echo "::error::expected the container-exited failure"; exit 1; }
+          echo "OK: fixture fails without the sidecar (exit $rc)"
+          clean "failure without sidecar"
+          set +e
+          out=$(boot crashing-app:test true)
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then echo "::error::crashing app passed with the sidecar"; exit 1; fi
+          grep -q 'did not stay up' <<<"$out" || { echo "::error::expected the container-exited failure"; exit 1; }
+          clean "failure with sidecar"
 
   # The change helper is inline in node-ci.yml and docker-build.yml. This job
   # extracts the marked block from each file and runs it against a scratch repo.
@@ -919,7 +987,7 @@ jobs:
           for v in GITLEAKS_VERSION GITLEAKS_SHA256; do
             check "$v" .github/workflows/secret-scan.yml || rc=1
           done
-          for v in TRIVY_VERSION TRIVY_IMAGE_DIGEST; do
+          for v in TRIVY_VERSION TRIVY_IMAGE_DIGEST POSTGRES_IMAGE_DIGEST; do
             check "$v" .github/workflows/docker-build.yml || rc=1
           done
           # The change helper is inline in both workflows; the copies must be identical.
@@ -952,11 +1020,13 @@ jobs:
       - node-ci
       - node-ci-no-install
       - docker-build
+      - docker-build-postgres
       - docker-build-outputs
       - output-assertions-unit
       - docker-build-input-cases
       - crashing-app-fails-boot-test
       - boot-test-rejects-redirect
+      - postgres-sidecar-cases
       - trivy-gate-trips
       - npm-audit-gate-trips
       - change-helper-cases
