@@ -4,7 +4,8 @@ name: node-ci
 # Node project. The *-command inputs are trusted caller code: they run with
 # `bash -e -o pipefail -c "$VAR"` and are never interpolated into a script.
 # test-env is data, not code: every line is validated before it reaches
-# $GITHUB_ENV. self-test.yml extracts the marked blocks below and tests them.
+# $GITHUB_ENV, and the audit steps run BEFORE that export so test-env can never
+# influence them. self-test.yml extracts the marked blocks below and tests them.
 on:
   workflow_call:
     inputs:
@@ -33,7 +34,7 @@ on:
         type: string
         default: ""
       test-command:
-        description: Test command. Empty skips the tests with a warning
+        description: Test command. Required, an empty value fails the job
         type: string
         default: npm test
       audit:
@@ -80,6 +81,32 @@ jobs:
           LINT_COMMAND: ${{ inputs.lint-command }}
         run: bash -e -o pipefail -c "$LINT_COMMAND"
 
+      - name: Did dependency files change?
+        id: audit-changes
+        if: inputs.audit
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          RE: ${{ env.CHANGE_RE }}
+        run: |
+          # >>> change-helper
+          case "$BASE" in ""|0000000000000000000000000000000000000000) echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0 ;; esac
+          FILES=$(git diff --name-only "$BASE" "$HEAD") || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          printf '%s\n' "$FILES" | grep -Eq "$RE" && echo "changed=true" >> "$GITHUB_OUTPUT" || echo "changed=false" >> "$GITHUB_OUTPUT"
+          # <<< change-helper
+
+      - name: npm audit
+        if: inputs.audit && steps.audit-changes.outputs.changed == 'true'
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          # >>> npm-audit
+          npm audit --omit=dev --audit-level=high
+          # <<< npm-audit
+
+      - name: npm audit skipped
+        if: inputs.audit && steps.audit-changes.outputs.changed != 'true'
+        run: echo "package.json and lockfiles unchanged, audit skipped"
+
       - name: Export test-env
         if: inputs.test-env != ''
         env:
@@ -100,7 +127,7 @@ jobs:
             fi
             key=${BASH_REMATCH[1]}
             case "$key" in
-              GITHUB_*|RUNNER_*|ACTIONS_*|DYLD_*|LD_*|PATH|BASH_ENV|BASHOPTS|SHELLOPTS|IFS|PS4|PROMPT_COMMAND|CDPATH|NODE_OPTIONS|NODE_PATH)
+              GITHUB_*|RUNNER_*|ACTIONS_*|GIT_*|NPM_CONFIG_*|npm_config_*|DYLD_*|LD_*|PATH|HOME|CHANGE_RE|BASH_ENV|BASHOPTS|SHELLOPTS|IFS|PS4|PROMPT_COMMAND|CDPATH|NODE_OPTIONS|NODE_PATH)
                 echo "::error::test-env line $i: $key may not be set here"
                 exit 1
                 ;;
@@ -125,27 +152,6 @@ jobs:
 
       - name: No test command given
         if: inputs.test-command == ''
-        run: echo "::warning::test-command is empty, no tests were run"
-
-      - name: Did dependency files change?
-        id: audit-changes
-        if: inputs.audit
-        env:
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          RE: ${{ env.CHANGE_RE }}
         run: |
-          # >>> change-helper
-          case "$BASE" in ""|0000000000000000000000000000000000000000) echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0 ;; esac
-          FILES=$(git diff --name-only "$BASE" "$HEAD") || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
-          printf '%s\n' "$FILES" | grep -Eq "$RE" && echo "changed=true" >> "$GITHUB_OUTPUT" || echo "changed=false" >> "$GITHUB_OUTPUT"
-          # <<< change-helper
-
-      - name: npm audit
-        if: inputs.audit && steps.audit-changes.outputs.changed == 'true'
-        working-directory: ${{ inputs.working-directory }}
-        run: npm audit --omit=dev --audit-level=high
-
-      - name: npm audit skipped
-        if: inputs.audit && steps.audit-changes.outputs.changed != 'true'
-        run: echo "package.json and lockfiles unchanged, audit skipped"
+          echo "::error::test-command is empty. Pass a test command, or run a no-op like 'true' on purpose."
+          exit 1

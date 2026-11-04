@@ -1,0 +1,10 @@
+{
+  "name": "ci-templates-fixture-vulnerable-npm-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fixture: depends on a lodash release with known high severity advisories. Used only to prove npm audit fails. Never installed or run.",
+  "license": "MIT",
+  "dependencies": {
+    "lodash": "4.17.15"
+  }
+}

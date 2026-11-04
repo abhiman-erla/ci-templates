@@ -19,7 +19,7 @@ on:
         type: string
         default: ""
       image-name:
-        description: Image name under ghcr.io (lower case). Empty means ghcr.io/<owner>/<repo>
+        description: Lower-case ghcr.io/... name, or a bare name (no slash) that becomes ghcr.io/<owner>/<name>. Empty means ghcr.io/<owner>/<repo>
         type: string
         default: ""
       smoke-port:
@@ -34,6 +34,10 @@ on:
         description: Environment for the boot test container, one KEY=value per line
         type: string
         default: ""
+      push:
+        description: Push the image on a push to main. false builds, tests and scans only (self-test uses this)
+        type: boolean
+        default: true
     outputs:
       image:
         description: Pushed image as name@digest. Empty unless this run pushed (push to main only)
@@ -61,7 +65,8 @@ jobs:
       TRIVY_VERSION: "0.69.3"
       TRIVY_IMAGE_DIGEST: sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c
       # Dependency and image-definition files: a change in any of them re-runs the scan.
-      CHANGE_RE: '(^|/)(Dockerfile[^/]*|\.dockerignore|package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|Pipfile\.lock|poetry\.lock|go\.mod|go\.sum|pom\.xml|Gemfile\.lock|Cargo\.lock)$'
+      # The resolved `dockerfile` input is added to this at run time (Validate inputs).
+      CHANGE_RE: '(^|/)([^/]*[Dd]ockerfile[^/]*|Containerfile[^/]*|\.dockerignore|package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|Pipfile\.lock|poetry\.lock|go\.mod|go\.sum|pom\.xml|Gemfile\.lock|Cargo\.lock)$'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -77,6 +82,7 @@ jobs:
           IN_PORT: ${{ inputs.smoke-port }}
           IN_PATH: ${{ inputs.smoke-path }}
         run: |
+          # >>> validate
           set -euo pipefail
           fail() { echo "::error::$1"; exit 1; }
           pathre='^[A-Za-z0-9._][A-Za-z0-9._/-]*$'
@@ -85,17 +91,22 @@ jobs:
           [[ $dockerfile =~ $pathre ]] || fail "dockerfile has characters outside [A-Za-z0-9._/-] or starts with '-'"
           [ -f "$dockerfile" ] || fail "dockerfile not found: $dockerfile"
           image=${IN_IMAGE_NAME:-ghcr.io/${GITHUB_REPOSITORY,,}}
+          case "$image" in */*) ;; *) image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/$image ;; esac
           imgre='^ghcr\.io/[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$'
           [[ $image =~ $imgre ]] || fail "image-name must be a lower-case ghcr.io/... name"
           [[ $IN_PORT =~ ^[0-9]{1,5}$ ]] || fail "smoke-port must be a number"
           [ "$((10#$IN_PORT))" -ge 1 ] && [ "$((10#$IN_PORT))" -le 65535 ] || fail "smoke-port out of range"
           urlre='^/[A-Za-z0-9._~/%?=&:@+,-]*$'
           [[ $IN_PATH =~ $urlre ]] || fail "smoke-path must start with / and use URL-safe characters"
+          # Changes to the Dockerfile that was actually used also trigger the scan, whatever it is called.
+          change_re="$CHANGE_RE|^${dockerfile//./\.}\$"
           {
             echo "dockerfile=$dockerfile"
             echo "image=$image"
             echo "image-ref=$image:$GITHUB_SHA"
+            echo "change-re=$change_re"
           } >> "$GITHUB_OUTPUT"
+          # <<< validate
 
       - name: Build
         env:
@@ -145,13 +156,17 @@ jobs:
               docker logs "$cid" || true
               exit 1
             fi
-            if curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:${SMOKE_PORT}${SMOKE_PATH}"; then
-              echo "boot test OK: ${SMOKE_PATH} answered on port ${SMOKE_PORT}"
-              exit 0
-            fi
+            # Only a 2xx counts. curl -f would also accept a 3xx, and -L is deliberately not used.
+            code=$(curl -s -o /dev/null --max-time 2 -w '%{http_code}' "http://127.0.0.1:${SMOKE_PORT}${SMOKE_PATH}" || true)
+            case "$code" in
+              2??)
+                echo "boot test OK: ${SMOKE_PATH} answered ${code} on port ${SMOKE_PORT}"
+                exit 0
+                ;;
+            esac
             sleep 1
           done
-          echo "::error::no successful answer from ${SMOKE_PATH} within 30 seconds"
+          echo "::error::no 2xx answer from ${SMOKE_PATH} within 30 seconds (last status: ${code:-none})"
           docker logs "$cid" || true
           exit 1
           # <<< boot-test
@@ -161,7 +176,7 @@ jobs:
         env:
           BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          RE: ${{ env.CHANGE_RE }}
+          RE: ${{ steps.validate.outputs.change-re }}
         run: |
           # >>> change-helper
           case "$BASE" in ""|0000000000000000000000000000000000000000) echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0 ;; esac
@@ -174,17 +189,25 @@ jobs:
         env:
           IMAGE_REF: ${{ steps.validate.outputs.image-ref }}
         run: |
+          # >>> trivy-scan
           set -euo pipefail
           tar_path="$RUNNER_TEMP/image.tar"
+          log="$RUNNER_TEMP/trivy.log"
           docker save "$IMAGE_REF" --output "$tar_path"
           chmod 644 "$tar_path"
           # No Docker socket is mounted: Trivy reads the tar only.
-          docker run --rm \
-            --security-opt no-new-privileges \
-            --volume "$tar_path:/scan/image.tar:ro" \
-            "aquasec/trivy@${TRIVY_IMAGE_DIGEST}" \
-            image --input /scan/image.tar --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1 --no-progress
+          set +e
+          docker run --rm             --security-opt no-new-privileges             --volume "$tar_path:/scan/image.tar:ro"             "aquasec/trivy@${TRIVY_IMAGE_DIGEST}"             image --input /scan/image.tar --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1 --no-progress 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
           rm -f "$tar_path"
+          [ "$rc" -eq 0 ] || exit "$rc"
+          # A clean result must come from a scan that saw something: an OS or language files.
+          if ! grep -Eq 'Detected OS|Number of language-specific files[[:space:]]+num=[1-9]' "$log"; then
+            echo "::error::Trivy reported no findings but also found no OS or packages to scan"
+            exit 1
+          fi
+          # <<< trivy-scan
 
       - name: Trivy skipped
         if: steps.scan-changes.outputs.changed != 'true'
@@ -192,7 +215,7 @@ jobs:
 
       - name: Push (push to main only)
         id: push
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: inputs.push && github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
           ACTOR: ${{ github.actor }}

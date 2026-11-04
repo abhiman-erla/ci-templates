@@ -50,8 +50,9 @@ jobs:
 
 ## node-ci
 
-Steps: checkout (full history), setup-node, install, lint, export `test-env`,
-setup, test, then `npm audit`.
+Steps: checkout (full history), setup-node, install, lint, `npm audit`, export
+`test-env`, setup, test. The audit runs before `test-env` is exported, so
+`test-env` cannot influence it.
 
 | Input | Default | Meaning |
 |---|---|---|
@@ -61,7 +62,7 @@ setup, test, then `npm audit`.
 | `lint-command` | `npm run lint --if-present` | Empty skips lint |
 | `setup-command` | empty | Runs before the tests (start a service, seed data). Empty skips |
 | `test-env` | empty | Extra environment for setup and test, one `KEY=value` per line |
-| `test-command` | `npm test` | Empty skips the tests with a warning |
+| `test-command` | `npm test` | Required. An empty value fails the job (use `true` on purpose if there are no tests) |
 | `audit` | `true` | `false` skips audit |
 
 No outputs.
@@ -69,10 +70,12 @@ No outputs.
 - The four `*-command` inputs are trusted caller code. They run as
   `bash -e -o pipefail -c "$VAR"` and are never interpolated into a script.
 - `test-env` is data. Each line must match `KEY=value` (no control
-  characters). Lines that set `GITHUB_*`, `RUNNER_*`, `ACTIONS_*`, `LD_*`,
-  `DYLD_*`, `PATH`, `BASH_ENV`, `BASHOPTS`, `SHELLOPTS`, `IFS`, `PS4`,
-  `PROMPT_COMMAND`, `CDPATH`, `NODE_OPTIONS` or `NODE_PATH` fail the job. It
-  applies to setup and test only, not to install or lint.
+  characters). Lines that set `GITHUB_*`, `RUNNER_*`, `ACTIONS_*`, `GIT_*`,
+  `NPM_CONFIG_*`, `npm_config_*`, `LD_*`, `DYLD_*`, `PATH`, `HOME`,
+  `CHANGE_RE`, `BASH_ENV`, `BASHOPTS`, `SHELLOPTS`, `IFS`, `PS4`,
+  `PROMPT_COMMAND`, `CDPATH`, `NODE_OPTIONS` or `NODE_PATH` fail the job.
+  Variables go to `$GITHUB_ENV`, so they apply to the setup and test steps
+  (and anything after them), not to install, lint or audit.
 - Audit runs `npm audit --omit=dev --audit-level=high`, only when a
   `package.json` or lockfile changed between the base and head of the event.
   Any doubt (no base, a zero SHA, a failed `git diff`, `workflow_dispatch`)
@@ -87,10 +90,11 @@ Trivy scan, push.
 |---|---|---|
 | `context` | `.` | Build context, relative to the repo root |
 | `dockerfile` | empty | Relative to the repo root. Empty means `<context>/Dockerfile` |
-| `image-name` | empty | Lower-case `ghcr.io/...` name. Empty means `ghcr.io/<owner>/<repo>` |
+| `image-name` | empty | Lower-case `ghcr.io/...` name, or a bare name with no `/` (for example `ethos`) which becomes `ghcr.io/<lower-case owner>/<name>`. Empty means `ghcr.io/<owner>/<repo>` |
 | `smoke-port` | `3000` | Port the app listens on inside the container |
-| `smoke-path` | `/` | Path polled for a 2xx, for up to 30 seconds |
+| `smoke-path` | `/` | Path polled for a 2xx status, for up to 30 seconds. Redirects (3xx) are not followed and do not count |
 | `smoke-env` | empty | Environment for the boot-test container, one `KEY=value` per line |
+| `push` | `true` | `false` builds, tests and scans but never pushes, even on main (this repo's self-test uses it so it never creates a package) |
 
 | Output | Meaning |
 |---|---|
@@ -98,12 +102,13 @@ Trivy scan, push.
 | `digest` | `sha256:...` digest the registry reported for the push |
 
 **`image` and `digest` are empty unless the run pushed.** Only a `push` event on
-`refs/heads/main` pushes; pull requests and other branches build, test and scan
-only. Deploy from `image` or `digest`, never from a tag.
+`refs/heads/main` with `push: true` pushes; pull requests, other branches and
+`push: false` build, test and scan only. Deploy from `image` or `digest`, never from a tag.
 
 **The caller must grant `packages: write`.** A caller's token limits a called
 workflow, so the job that calls `docker-build.yml` needs it, even though the
-workflow also requests it itself. Without it the run fails at startup:
+workflow also requests it itself. Without it the run fails at startup, even
+with `push: false` (the permission is a ceiling there, nothing is written):
 
 ```yaml
 jobs:
@@ -125,16 +130,27 @@ How it behaves:
   `digest` is read from `docker push` output and checked with
   `docker manifest inspect`.
 - Boot test: the image runs with `smoke-env`, the port published on
-  `127.0.0.1`, and `smoke-path` is polled once a second for 30 seconds. It fails
-  at once if the container exits.
+  `127.0.0.1`, and `smoke-path` is polled once a second for 30 seconds. Only an
+  HTTP 2xx passes. It fails at once if the container exits.
 - Trivy 0.69.3 runs as `aquasec/trivy@sha256:...` on the saved tar. No Docker
   socket is mounted. It fails on fixed HIGH or CRITICAL findings
   (`--ignore-unfixed --severity HIGH,CRITICAL`). It runs only when the
-  Dockerfile, `.dockerignore` or a dependency manifest or lockfile changed
-  (same doubt rule as the audit: unknown means run it). Trivy downloads its
-  vulnerability database on each run.
+  Dockerfile, `.dockerignore` or a dependency manifest or lockfile changed,
+  or the file you passed as `dockerfile` (any name; `*Dockerfile*` and
+  `Containerfile*` also match) changed, with the same doubt rule as the audit:
+  unknown means run it. A clean result must also show Trivy found an OS or
+  language files to scan; an image it could not scan fails. Trivy downloads
+  its vulnerability database on each run.
 - Login uses the caller's `GITHUB_TOKEN`; it is passed through the
   environment and removed again with `docker logout`.
+
+## Do the gates really trip?
+
+`self-test.yml` runs the audit and Trivy blocks, extracted from the workflows,
+against known-bad input and requires failure: `npm audit` on a lockfile pinning
+`lodash@4.17.15`, and Trivy on a digest-pinned `alpine:3.10.0` image (it must
+print a CVE), plus an image with nothing to scan. The assertions on the
+`image` and `digest` outputs are unit-tested on sample values.
 
 ## Versioning
 

@@ -61,19 +61,246 @@ jobs:
       test-command: node --version
       audit: false
 
-  # Pushes only on a push to main (the fixture image goes to ghcr.io/abhiman-erla).
-  # The caller must grant packages: write or the called workflow cannot start.
+  # push: false, so no package is ever created by this repo's self-test. The
+  # caller must still grant packages: write or the called workflow cannot start;
+  # that grant is only a ceiling, nothing is pushed. The bare image-name also
+  # exercises the ghcr.io/<owner>/<name> prefixing.
   docker-build:
     uses: ./.github/workflows/docker-build.yml
     permissions:
       contents: read
-      packages: write # push the image to ghcr.io on a push to main
+      packages: write # ceiling for the called workflow; push is false
     with:
       context: fixtures/node-app
-      image-name: ghcr.io/abhiman-erla/ci-templates-fixture
+      image-name: ci-templates-fixture
+      push: false
       smoke-path: /healthz
       smoke-env: |
         SMOKE_FLAG=on
+
+  # With push off, the outputs must be empty. The assertion block is shared with
+  # output-assertions-unit, which proves it can fail.
+  docker-build-outputs:
+    needs: docker-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      IMAGE: ${{ needs.docker-build.outputs.image }}
+      DIGEST: ${{ needs.docker-build.outputs.digest }}
+      NAME: ghcr.io/abhiman-erla/ci-templates-fixture
+      EXPECT: empty
+    steps:
+      - name: Assert outputs
+        run: |
+          # >>> assert-outputs
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          case "$EXPECT" in
+            empty)
+              [ -z "$DIGEST" ] || fail "digest should be empty, got '$DIGEST'"
+              [ -z "$IMAGE" ] || fail "image should be empty, got '$IMAGE'"
+              ;;
+            pushed)
+              [[ $DIGEST =~ ^sha256:[0-9a-f]{64}$ ]] || fail "digest is not sha256:<64 hex>: '$DIGEST'"
+              [ "$IMAGE" = "${NAME}@${DIGEST}" ] || fail "image '$IMAGE' is not ${NAME}@${DIGEST}"
+              ;;
+            *) fail "EXPECT must be empty or pushed" ;;
+          esac
+          echo "output assertions OK ($EXPECT)"
+          # <<< assert-outputs
+
+  # The pushed-output shape cannot be produced without pushing, so the shared
+  # assertion block is run on sample values, good and bad.
+  output-assertions-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Assertion block accepts good values and rejects bad ones
+        run: |
+          set -euo pipefail
+          sed -n '/# >>> assert-outputs$/,/# <<< assert-outputs$/p' .github/workflows/self-test.yml | sed '1d;$d' > "$RUNNER_TEMP/assert.sh"
+          [ -s "$RUNNER_TEMP/assert.sh" ] || { echo "::error::assert-outputs block not found"; exit 1; }
+          fails=0
+          good="sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          name=ghcr.io/o/x
+          t() { # label ok|bad EXPECT IMAGE DIGEST
+            local rc=0
+            EXPECT=$3 IMAGE=$4 DIGEST=$5 NAME=$name bash "$RUNNER_TEMP/assert.sh" > /dev/null 2>&1 || rc=$?
+            if { [ "$2" = ok ] && [ "$rc" -eq 0 ]; } || { [ "$2" = bad ] && [ "$rc" -ne 0 ]; }; then echo "ok   $1"
+            else echo "::error::$1 (expected $2, rc=$rc)"; fails=1; fi
+          }
+          [ "${#good}" -eq 71 ] || { echo "::error::test setup: bad sample digest"; exit 1; }
+          t "empty outputs, expect empty" ok empty "" ""
+          t "digest set, expect empty" bad empty "" "$good"
+          t "image set, expect empty" bad empty "$name@$good" ""
+          t "good pushed values" ok pushed "$name@$good" "$good"
+          t "empty values, expect pushed" bad pushed "" ""
+          t "digest too short" bad pushed "$name@sha256:abc" "sha256:abc"
+          t "digest upper-case hex" bad pushed "$name@${good^^}" "${good^^}"
+          t "digest missing prefix" bad pushed "$name@${good#sha256:}" "${good#sha256:}"
+          t "image uses a tag, not the digest" bad pushed "$name:latest" "$good"
+          t "image has the wrong name" bad pushed "ghcr.io/o/y@$good" "$good"
+          t "unknown EXPECT" bad other "" ""
+          exit "$fails"
+
+  # Inputs reach the validate block as data; check what it accepts and produces.
+  docker-build-input-cases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate block cases
+        run: |
+          set -euo pipefail
+          sed -n '/# >>> validate$/,/# <<< validate$/p' .github/workflows/docker-build.yml | sed '1d;$d' > "$RUNNER_TEMP/validate.sh"
+          [ -s "$RUNNER_TEMP/validate.sh" ] || { echo "::error::validate block not found"; exit 1; }
+          base_re=$(grep -E '^ +CHANGE_RE:' .github/workflows/docker-build.yml | head -1 | sed -E "s/^ +CHANGE_RE: *'//; s/'\$//")
+          fails=0
+          run_v() { # context dockerfile image port path
+            : > "$RUNNER_TEMP/v-out"
+            GITHUB_OUTPUT="$RUNNER_TEMP/v-out" GITHUB_REPOSITORY=Abhiman-Erla/Helios GITHUB_REPOSITORY_OWNER=Abhiman-Erla GITHUB_SHA=abc123 CHANGE_RE="$base_re" \
+              IN_CONTEXT=$1 IN_DOCKERFILE=$2 IN_IMAGE_NAME=$3 IN_PORT=$4 IN_PATH=$5 bash "$RUNNER_TEMP/validate.sh" > /dev/null 2>&1
+          }
+          got() { sed -n "s/^$1=//p" "$RUNNER_TEMP/v-out"; }
+          want_image() { # label expected context dockerfile image
+            if run_v "$3" "$4" "$5" 3000 /healthz && [ "$(got image)" = "$2" ]; then echo "ok   $1 -> $2"
+            else echo "::error::$1: expected image $2, got '$(got image)'"; fails=1; fi
+          }
+          want_reject() { # label context dockerfile image port path
+            if run_v "$2" "$3" "$4" "$5" "$6"; then echo "::error::accepted: $1"; fails=1; else echo "ok   rejected: $1"; fi
+          }
+          want_image "bare name gets ghcr.io/<owner>/" ghcr.io/abhiman-erla/ethos fixtures/node-app "" ethos
+          want_image "full name kept" ghcr.io/o/x fixtures/node-app "" ghcr.io/o/x
+          want_image "empty name is the repository" ghcr.io/abhiman-erla/helios fixtures/node-app "" ""
+          want_reject "upper-case bare name" fixtures/node-app "" Ethos 3000 /
+          want_reject "other registry" fixtures/node-app "" docker.io/x/y 3000 /
+          want_reject "upper-case full name" fixtures/node-app "" ghcr.io/O/y 3000 /
+          want_reject "context starting with -" -x "" "" 3000 /
+          want_reject "context with a semicolon" 'a;rm' "" "" 3000 /
+          want_reject "missing Dockerfile" fixtures/node-app nope/Dockerfile "" 3000 /
+          want_reject "port out of range" fixtures/node-app "" "" 70000 /
+          want_reject "path without a slash" fixtures/node-app "" "" 3000 x
+          want_reject "path with command substitution" fixtures/node-app "" "" 3000 "/\$(id)"
+          run_v . fixtures/node-app/Dockerfile "" 3000 /
+          if grep -q '^change-re=.*|^fixtures/node-app/Dockerfile\$$' "$RUNNER_TEMP/v-out"; then
+            echo "ok   change-re includes the resolved dockerfile path"
+          else
+            echo "::error::change-re does not include the dockerfile path"; fails=1
+          fi
+          exit "$fails"
+
+  # Only a 2xx is healthy: a 302 must not pass (curl -f alone would accept it).
+  boot-test-rejects-redirect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the node fixture
+        run: docker build --tag node-app:test fixtures/node-app
+
+      - name: 2xx passes, 3xx fails
+        run: |
+          set -euo pipefail
+          sed -n '/# >>> boot-test$/,/# <<< boot-test$/p' .github/workflows/docker-build.yml | sed '1d;$d' > "$RUNNER_TEMP/boot-test.sh"
+          [ -s "$RUNNER_TEMP/boot-test.sh" ] || { echo "::error::boot-test block not found"; exit 1; }
+          boot() { IMAGE_REF=node-app:test SMOKE_PORT=3000 SMOKE_PATH=$1 SMOKE_ENV="SMOKE_FLAG=on" bash "$RUNNER_TEMP/boot-test.sh" 2>&1; }
+          boot /healthz > /dev/null
+          echo "OK: control, /healthz answers 200"
+          set +e
+          out=$(boot /redirect)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then echo "::error::boot test accepted a 302"; exit 1; fi
+          grep -q 'no 2xx answer' <<<"$out" || { echo "::error::expected the no-2xx failure (exit $rc)"; exit 1; }
+          echo "OK: boot test rejected a redirect (exit $rc)"
+
+  # The Trivy gate, run exactly as docker-build.yml runs it (extracted block), must
+  # fail on a digest-pinned, known-vulnerable public image and must not pass an
+  # image it could not scan. Needs the vulnerability DB (network).
+  trivy-gate-trips:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # alpine 3.10.0 (index digest, checked on Docker Hub): 12 fixed HIGH/CRITICAL findings
+      VULN_IMAGE: alpine@sha256:ca1c944a4f8486a153024d9965aafbe24f5723c1d5c02f4964c045a16d19dc54
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Extract the scan block
+        run: |
+          set -euo pipefail
+          sed -n '/# >>> trivy-scan$/,/# <<< trivy-scan$/p' .github/workflows/docker-build.yml | sed '1d;$d' > "$RUNNER_TEMP/trivy-scan.sh"
+          [ -s "$RUNNER_TEMP/trivy-scan.sh" ] || { echo "::error::trivy-scan block not found"; exit 1; }
+
+      - name: Known-vulnerable image must fail with a CVE in the output
+        run: |
+          set -euo pipefail
+          docker pull --quiet "$VULN_IMAGE"
+          docker tag "$VULN_IMAGE" vulnerable:test
+          set +e
+          out=$(IMAGE_REF=vulnerable:test bash "$RUNNER_TEMP/trivy-scan.sh" 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then echo "::error::Trivy gate passed a known-vulnerable image"; exit 1; fi
+          grep -q 'CVE-' <<<"$out" || { echo "::error::expected a CVE in the Trivy output (exit $rc)"; exit 1; }
+          echo "OK: Trivy gate rejected the vulnerable image (exit $rc)"
+
+      - name: An image with nothing to scan must not pass
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/empty-image"
+          mkdir -p "$d"
+          echo nothing > "$d/marker.txt"
+          printf 'FROM scratch\nCOPY marker.txt /marker.txt\n' > "$d/Dockerfile"
+          docker build --quiet --tag empty:test "$d"
+          set +e
+          out=$(IMAGE_REF=empty:test bash "$RUNNER_TEMP/trivy-scan.sh" 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then echo "::error::Trivy gate passed an image it could not scan"; exit 1; fi
+          grep -q 'found no OS or packages' <<<"$out" || { echo "::error::expected the nothing-scanned failure (exit $rc)"; exit 1; }
+          echo "OK: Trivy gate failed an unscannable image (exit $rc)"
+
+  # npm audit, run as node-ci.yml runs it (extracted block): a lockfile with a
+  # known-vulnerable package must fail, a clean one must pass.
+  npm-audit-gate-trips:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Vulnerable lockfile fails, clean lockfile passes
+        run: |
+          set -euo pipefail
+          sed -n '/# >>> npm-audit$/,/# <<< npm-audit$/p' .github/workflows/node-ci.yml | sed '1d;$d' > "$RUNNER_TEMP/npm-audit.sh"
+          [ -s "$RUNNER_TEMP/npm-audit.sh" ] || { echo "::error::npm-audit block not found"; exit 1; }
+          (cd fixtures/node-app && bash "$RUNNER_TEMP/npm-audit.sh")
+          echo "OK: control, node-app audits clean"
+          set +e
+          out=$(cd fixtures/vulnerable-npm-app && bash "$RUNNER_TEMP/npm-audit.sh" 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then echo "::error::npm audit passed a known-vulnerable lockfile"; exit 1; fi
+          grep -qiE 'severity: (high|critical)' <<<"$out" || { echo "::error::expected a high or critical finding (exit $rc)"; exit 1; }
+          echo "OK: npm audit rejected the vulnerable lockfile (exit $rc)"
 
   # A failing reusable call would fail this whole run, so the negative case runs
   # the boot-test block extracted from docker-build.yml (the same text the real
@@ -121,6 +348,8 @@ jobs:
           regex_of() { grep -E '^ +CHANGE_RE:' "$1" | head -1 | sed -E "s/^ +CHANGE_RE: *'//; s/'\$//"; }
           extract "$wf/node-ci.yml" change-helper > "$RUNNER_TEMP/helper-node-ci.sh"
           extract "$wf/docker-build.yml" change-helper > "$RUNNER_TEMP/helper-docker-build.sh"
+          extract "$wf/docker-build.yml" validate > "$RUNNER_TEMP/validate.sh"
+          [ -s "$RUNNER_TEMP/validate.sh" ] || { echo "::error::validate block missing in docker-build.yml"; exit 1; }
           for f in node-ci docker-build; do
             [ -s "$RUNNER_TEMP/helper-$f.sh" ] || { echo "::error::change-helper block missing in $f.yml"; exit 1; }
           done
@@ -140,13 +369,17 @@ jobs:
           echo 'FROM scratch' > Dockerfile;                c3=$(commit dockerfile)
           echo x > docs/xpackage-lock.json;                c4=$(commit lookalike)
           mkdir -p app; echo '{}' > app/package.json;      c5=$(commit nested-package-json)
+          echo x > Dockerfile.prod;                        c6=$(commit dockerfile-prod)
+          echo x > api.Dockerfile;                         c7=$(commit named-dockerfile)
+          echo x > Containerfile;                          c8=$(commit containerfile)
+          mkdir -p docker; echo x > docker/api.prod;       c9=$(commit custom-dockerfile)
           zero=0000000000000000000000000000000000000000
           unknown=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 
           fails=0
           check() { # workflow base head expected label
             local name=$1 base=$2 head=$3 want=$4 label=$5 re out got
-            re=${res[$name]}
+            re=${6:-${res[$name]}}
             out="$RUNNER_TEMP/out-$name"; : > "$out"
             BASE=$base HEAD=$head RE=$re GITHUB_OUTPUT=$out bash "$RUNNER_TEMP/helper-$name.sh"
             got=$(cat "$out")
@@ -165,6 +398,19 @@ jobs:
           done
           check docker-build "$c2" "$c3" true  "Dockerfile change"
           check node-ci      "$c2" "$c3" false "Dockerfile change is not an audit trigger"
+          check docker-build "$c5" "$c6" true  "Dockerfile.prod"
+          check docker-build "$c6" "$c7" true  "api.Dockerfile"
+          check docker-build "$c7" "$c8" true  "Containerfile"
+          check node-ci      "$c5" "$c6" false "Dockerfile.prod is not an audit trigger"
+          check docker-build "$c8" "$c9" false "custom Dockerfile path is missed by the base regex alone"
+          # The validate block adds the resolved dockerfile input to the regex.
+          : > "$RUNNER_TEMP/v-out"
+          GITHUB_OUTPUT="$RUNNER_TEMP/v-out" GITHUB_REPOSITORY=o/r GITHUB_REPOSITORY_OWNER=o GITHUB_SHA=abc CHANGE_RE="${res[docker-build]}" \
+            IN_CONTEXT=. IN_DOCKERFILE=docker/api.prod IN_IMAGE_NAME="" IN_PORT=3000 IN_PATH=/ bash "$RUNNER_TEMP/validate.sh" > /dev/null
+          custom_re=$(sed -n 's/^change-re=//p' "$RUNNER_TEMP/v-out")
+          check docker-build "$c8" "$c9" true  "custom Dockerfile path via the validate block's regex" "$custom_re"
+          check docker-build "$c4" "$c5" true  "validate-block regex still catches nested package.json" "$custom_re"
+          check docker-build "$c3" "$c4" false "validate-block regex still ignores lookalikes" "$custom_re"
           exit "$fails"
 
   # test-env is data. Same extraction approach: run the real block on hostile input.
@@ -196,6 +442,11 @@ jobs:
           expect_fail 'PATH=/evil' "PATH"
           expect_fail 'BASH_ENV=/evil' "BASH_ENV"
           expect_fail 'LD_PRELOAD=/evil.so' "LD_PRELOAD"
+          expect_fail 'CHANGE_RE=x' "CHANGE_RE (would skip the audit)"
+          expect_fail 'NPM_CONFIG_REGISTRY=https://evil.example' "NPM_CONFIG_REGISTRY"
+          expect_fail 'npm_config_registry=https://evil.example' "npm_config_registry"
+          expect_fail 'GIT_DIR=/x' "GIT_ prefix"
+          expect_fail 'HOME=/tmp/x' "HOME"
           expect_fail 'NO_EQUALS_SIGN' "no ="
           expect_fail '1BAD=x' "key starts with a digit"
           expect_fail '=x' "empty key"
@@ -352,7 +603,13 @@ jobs:
       - node-ci
       - node-ci-no-install
       - docker-build
+      - docker-build-outputs
+      - output-assertions-unit
+      - docker-build-input-cases
       - crashing-app-fails-boot-test
+      - boot-test-rejects-redirect
+      - trivy-gate-trips
+      - npm-audit-gate-trips
       - change-helper-cases
       - test-env-validation
       - actionlint-rejects-bad-workflow
