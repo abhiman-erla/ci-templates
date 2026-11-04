@@ -130,7 +130,7 @@ jobs:
           out=$(gitleaks dir --no-banner --redact --verbose "$d" 2>&1)
           rc=$?
           set -e
-          echo "$out" | sed "s/${suffix}/<redacted>/g"
+          echo "${out//"$suffix"/<redacted>}"
           if [ "$rc" -eq 0 ]; then echo "::error::gitleaks accepted the planted token"; exit 1; fi
           grep -q 'github-pat' <<<"$out" || { echo "::error::expected a github-pat finding (exit $rc)"; exit 1; }
           echo "OK: gitleaks rejected the planted token (exit $rc)"
