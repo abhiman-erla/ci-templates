@@ -1,0 +1,215 @@
+name: docker-build
+
+# Reusable. Builds an image with plain `docker build`, boot-tests it, scans the
+# saved image tar with Trivy (run as a container pinned by digest, no Docker
+# socket), then pushes that SAME local image to ghcr.io on a push to main.
+# There is no rebuild between scan and push, so the scanned image is the pushed
+# image. The caller must grant `packages: write` (a caller's token limits what
+# this workflow can use); see README. self-test.yml extracts the marked blocks
+# below and tests them, and its drift job compares the pins.
+on:
+  workflow_call:
+    inputs:
+      context:
+        description: Docker build context, relative to the repo root
+        type: string
+        default: .
+      dockerfile:
+        description: Dockerfile path relative to the repo root. Empty means <context>/Dockerfile
+        type: string
+        default: ""
+      image-name:
+        description: Image name under ghcr.io (lower case). Empty means ghcr.io/<owner>/<repo>
+        type: string
+        default: ""
+      smoke-port:
+        description: Port the app listens on inside the container
+        type: string
+        default: "3000"
+      smoke-path:
+        description: Path polled for a 2xx during the boot test (up to 30 seconds)
+        type: string
+        default: /
+      smoke-env:
+        description: Environment for the boot test container, one KEY=value per line
+        type: string
+        default: ""
+    outputs:
+      image:
+        description: Pushed image as name@digest. Empty unless this run pushed (push to main only)
+        value: ${{ jobs.build.outputs.image }}
+      digest:
+        description: Registry digest of the pushed image (sha256:...). Empty unless this run pushed
+        value: ${{ jobs.build.outputs.digest }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Granted here because the push step needs it. The caller's job must grant
+    # at least the same, or the run fails at startup.
+    permissions:
+      contents: read
+      packages: write # push the image to ghcr.io on a push to main
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      TRIVY_VERSION: "0.69.3"
+      TRIVY_IMAGE_DIGEST: sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c
+      # Dependency and image-definition files: a change in any of them re-runs the scan.
+      CHANGE_RE: '(^|/)(Dockerfile[^/]*|\.dockerignore|package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|Pipfile\.lock|poetry\.lock|go\.mod|go\.sum|pom\.xml|Gemfile\.lock|Cargo\.lock)$'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate inputs
+        id: validate
+        env:
+          IN_CONTEXT: ${{ inputs.context }}
+          IN_DOCKERFILE: ${{ inputs.dockerfile }}
+          IN_IMAGE_NAME: ${{ inputs.image-name }}
+          IN_PORT: ${{ inputs.smoke-port }}
+          IN_PATH: ${{ inputs.smoke-path }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          pathre='^[A-Za-z0-9._][A-Za-z0-9._/-]*$'
+          [[ $IN_CONTEXT =~ $pathre ]] || fail "context has characters outside [A-Za-z0-9._/-] or starts with '-'"
+          dockerfile=${IN_DOCKERFILE:-$IN_CONTEXT/Dockerfile}
+          [[ $dockerfile =~ $pathre ]] || fail "dockerfile has characters outside [A-Za-z0-9._/-] or starts with '-'"
+          [ -f "$dockerfile" ] || fail "dockerfile not found: $dockerfile"
+          image=${IN_IMAGE_NAME:-ghcr.io/${GITHUB_REPOSITORY,,}}
+          imgre='^ghcr\.io/[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$'
+          [[ $image =~ $imgre ]] || fail "image-name must be a lower-case ghcr.io/... name"
+          [[ $IN_PORT =~ ^[0-9]{1,5}$ ]] || fail "smoke-port must be a number"
+          [ "$((10#$IN_PORT))" -ge 1 ] && [ "$((10#$IN_PORT))" -le 65535 ] || fail "smoke-port out of range"
+          urlre='^/[A-Za-z0-9._~/%?=&:@+,-]*$'
+          [[ $IN_PATH =~ $urlre ]] || fail "smoke-path must start with / and use URL-safe characters"
+          {
+            echo "dockerfile=$dockerfile"
+            echo "image=$image"
+            echo "image-ref=$image:$GITHUB_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          CONTEXT: ${{ inputs.context }}
+          DOCKERFILE: ${{ steps.validate.outputs.dockerfile }}
+          IMAGE_REF: ${{ steps.validate.outputs.image-ref }}
+          APP_VERSION: ${{ github.sha }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          docker build --pull \
+            --file "$DOCKERFILE" \
+            --build-arg "APP_VERSION=$APP_VERSION" \
+            --label "org.opencontainers.image.source=$SOURCE_URL" \
+            --label "org.opencontainers.image.revision=$APP_VERSION" \
+            --tag "$IMAGE_REF" \
+            "$CONTEXT"
+
+      - name: Boot test
+        env:
+          IMAGE_REF: ${{ steps.validate.outputs.image-ref }}
+          SMOKE_PORT: ${{ inputs.smoke-port }}
+          SMOKE_PATH: ${{ inputs.smoke-path }}
+          SMOKE_ENV: ${{ inputs.smoke-env }}
+        run: |
+          # >>> boot-test
+          set -euo pipefail
+          re='^[A-Za-z_][A-Za-z0-9_]*=[^[:cntrl:]]*$'
+          args=()
+          while IFS= read -r line || [ -n "$line" ]; do
+            line=${line%$'\r'}
+            line=${line#"${line%%[![:space:]]*}"}
+            [ -z "$line" ] && continue
+            if ! [[ $line =~ $re ]]; then
+              echo "::error::smoke-env line is not KEY=value"
+              exit 1
+            fi
+            args+=(-e "$line")
+          done <<< "$SMOKE_ENV"
+          cid=$(docker run -d -p "127.0.0.1:${SMOKE_PORT}:${SMOKE_PORT}" "${args[@]}" "$IMAGE_REF")
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          deadline=$((SECONDS + 30))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            state=$(docker inspect -f '{{.State.Status}}' "$cid")
+            if [ "$state" != "running" ]; then
+              echo "::error::container is $state, it did not stay up"
+              docker logs "$cid" || true
+              exit 1
+            fi
+            if curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:${SMOKE_PORT}${SMOKE_PATH}"; then
+              echo "boot test OK: ${SMOKE_PATH} answered on port ${SMOKE_PORT}"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::no successful answer from ${SMOKE_PATH} within 30 seconds"
+          docker logs "$cid" || true
+          exit 1
+          # <<< boot-test
+
+      - name: Did the image definition or dependencies change?
+        id: scan-changes
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          RE: ${{ env.CHANGE_RE }}
+        run: |
+          # >>> change-helper
+          case "$BASE" in ""|0000000000000000000000000000000000000000) echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0 ;; esac
+          FILES=$(git diff --name-only "$BASE" "$HEAD") || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          printf '%s\n' "$FILES" | grep -Eq "$RE" && echo "changed=true" >> "$GITHUB_OUTPUT" || echo "changed=false" >> "$GITHUB_OUTPUT"
+          # <<< change-helper
+
+      - name: Trivy scan (HIGH and CRITICAL, fixed only)
+        if: steps.scan-changes.outputs.changed == 'true'
+        env:
+          IMAGE_REF: ${{ steps.validate.outputs.image-ref }}
+        run: |
+          set -euo pipefail
+          tar_path="$RUNNER_TEMP/image.tar"
+          docker save "$IMAGE_REF" --output "$tar_path"
+          chmod 644 "$tar_path"
+          # No Docker socket is mounted: Trivy reads the tar only.
+          docker run --rm \
+            --security-opt no-new-privileges \
+            --volume "$tar_path:/scan/image.tar:ro" \
+            "aquasec/trivy@${TRIVY_IMAGE_DIGEST}" \
+            image --input /scan/image.tar --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1 --no-progress
+          rm -f "$tar_path"
+
+      - name: Trivy skipped
+        if: steps.scan-changes.outputs.changed != 'true'
+        run: echo "Dockerfile and dependency files unchanged, Trivy scan skipped"
+
+      - name: Push (push to main only)
+        id: push
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          IMAGE: ${{ steps.validate.outputs.image }}
+          IMAGE_REF: ${{ steps.validate.outputs.image-ref }}
+        run: |
+          set -euo pipefail
+          [ -n "$GH_TOKEN" ] || { echo "::error::github.token is empty"; exit 1; }
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+          # Push the image that was just scanned. The digest is the one the registry reported.
+          docker push "$IMAGE_REF" | tee "$RUNNER_TEMP/push.log"
+          digest=$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' "$RUNNER_TEMP/push.log" | tail -n 1)
+          [ -n "$digest" ] || { echo "::error::could not read the pushed digest"; exit 1; }
+          docker manifest inspect "$IMAGE@$digest" > /dev/null
+          {
+            echo "digest=$digest"
+            echo "image=$IMAGE@$digest"
+          } >> "$GITHUB_OUTPUT"
+          echo "pushed $IMAGE@$digest"

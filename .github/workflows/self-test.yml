@@ -26,6 +26,8 @@ env:
   ZIZMOR_SHA256: 95776c59c2d4c0d6e10560647b4830762b8dbcca8d7d9b7469ff227c73a6fee6
   GITLEAKS_VERSION: "8.30.1"
   GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  TRIVY_VERSION: "0.69.3"
+  TRIVY_IMAGE_DIGEST: sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c
 
 jobs:
   secret-scan:
@@ -37,6 +39,170 @@ jobs:
     uses: ./.github/workflows/workflow-lint.yml
     permissions:
       contents: read
+
+  node-ci:
+    uses: ./.github/workflows/node-ci.yml
+    permissions:
+      contents: read
+    with:
+      working-directory: fixtures/node-app
+      setup-command: touch .setup-done
+      test-env: |
+        FIXTURE_FLAG=a=b c
+
+  # Skip paths: no install (so no npm cache), no lint, no audit.
+  node-ci-no-install:
+    uses: ./.github/workflows/node-ci.yml
+    permissions:
+      contents: read
+    with:
+      install-command: ""
+      lint-command: ""
+      test-command: node --version
+      audit: false
+
+  # Pushes only on a push to main (the fixture image goes to ghcr.io/abhiman-erla).
+  # The caller must grant packages: write or the called workflow cannot start.
+  docker-build:
+    uses: ./.github/workflows/docker-build.yml
+    permissions:
+      contents: read
+      packages: write # push the image to ghcr.io on a push to main
+    with:
+      context: fixtures/node-app
+      image-name: ghcr.io/abhiman-erla/ci-templates-fixture
+      smoke-path: /healthz
+      smoke-env: |
+        SMOKE_FLAG=on
+
+  # A failing reusable call would fail this whole run, so the negative case runs
+  # the boot-test block extracted from docker-build.yml (the same text the real
+  # workflow runs) and requires it to fail.
+  crashing-app-fails-boot-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the crashing fixture
+        run: docker build --tag crashing-app:test fixtures/crashing-app
+
+      - name: Boot test must fail
+        run: |
+          set -euo pipefail
+          sed -n '/# >>> boot-test$/,/# <<< boot-test$/p' .github/workflows/docker-build.yml | sed '1d;$d' > "$RUNNER_TEMP/boot-test.sh"
+          [ -s "$RUNNER_TEMP/boot-test.sh" ] || { echo "::error::boot-test block not found"; exit 1; }
+          set +e
+          out=$(IMAGE_REF=crashing-app:test SMOKE_PORT=3000 SMOKE_PATH=/healthz SMOKE_ENV="" bash "$RUNNER_TEMP/boot-test.sh" 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then echo "::error::boot test passed a crashing app"; exit 1; fi
+          grep -q 'did not stay up' <<<"$out" || { echo "::error::expected the container-exited failure (exit $rc)"; exit 1; }
+          echo "OK: boot test rejected the crashing app (exit $rc)"
+
+  # The change helper is inline in node-ci.yml and docker-build.yml. This job
+  # extracts the marked block from each file and runs it against a scratch repo.
+  change-helper-cases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Docs-only is false; lockfile, Dockerfile and unusable bases are true
+        run: |
+          set -euo pipefail
+          wf="$PWD/.github/workflows"
+          extract() { sed -n "/# >>> $2\$/,/# <<< $2\$/p" "$1" | sed '1d;$d'; }
+          regex_of() { grep -E '^ +CHANGE_RE:' "$1" | head -1 | sed -E "s/^ +CHANGE_RE: *'//; s/'\$//"; }
+          extract "$wf/node-ci.yml" change-helper > "$RUNNER_TEMP/helper-node-ci.sh"
+          extract "$wf/docker-build.yml" change-helper > "$RUNNER_TEMP/helper-docker-build.sh"
+          for f in node-ci docker-build; do
+            [ -s "$RUNNER_TEMP/helper-$f.sh" ] || { echo "::error::change-helper block missing in $f.yml"; exit 1; }
+          done
+          declare -A res
+          res[node-ci]=$(regex_of "$wf/node-ci.yml")
+          res[docker-build]=$(regex_of "$wf/docker-build.yml")
+
+          r="$RUNNER_TEMP/helper-repo"
+          rm -rf "$r"; mkdir -p "$r"; cd "$r"
+          git init -q -b main
+          git config user.name tester
+          git config user.email tester@example.invalid
+          commit() { git add -A; git commit -q -m "$1"; git rev-parse HEAD; }
+          echo hello > README.md;                          c0=$(commit base)
+          mkdir docs; echo x > docs/guide.md;              c1=$(commit docs)
+          echo '{}' > package-lock.json;                   c2=$(commit lockfile)
+          echo 'FROM scratch' > Dockerfile;                c3=$(commit dockerfile)
+          echo x > docs/xpackage-lock.json;                c4=$(commit lookalike)
+          mkdir -p app; echo '{}' > app/package.json;      c5=$(commit nested-package-json)
+          zero=0000000000000000000000000000000000000000
+          unknown=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+
+          fails=0
+          check() { # workflow base head expected label
+            local name=$1 base=$2 head=$3 want=$4 label=$5 re out got
+            re=${res[$name]}
+            out="$RUNNER_TEMP/out-$name"; : > "$out"
+            BASE=$base HEAD=$head RE=$re GITHUB_OUTPUT=$out bash "$RUNNER_TEMP/helper-$name.sh"
+            got=$(cat "$out")
+            if [ "$got" = "changed=$want" ]; then echo "ok   $name: $label -> $got"
+            else echo "::error::$name: $label expected changed=$want, got '$got'"; fails=1; fi
+          }
+          for name in node-ci docker-build; do
+            check "$name" "$c0" "$c1" false "docs-only change"
+            check "$name" "$c1" "$c2" true  "lockfile change"
+            check "$name" "$c3" "$c4" false "lookalike file name"
+            check "$name" "$c4" "$c5" true  "nested package.json"
+            check "$name" "$unknown" "$c3" true "unknown base"
+            check "$name" "$c0" "$unknown" true "unknown head"
+            check "$name" "$zero" "$c3" true "zero base SHA"
+            check "$name" "" "$c3" true "empty base"
+          done
+          check docker-build "$c2" "$c3" true  "Dockerfile change"
+          check node-ci      "$c2" "$c3" false "Dockerfile change is not an audit trigger"
+          exit "$fails"
+
+  # test-env is data. Same extraction approach: run the real block on hostile input.
+  test-env-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Valid lines are written, injection attempts are rejected
+        run: |
+          set -euo pipefail
+          sed -n '/# >>> test-env$/,/# <<< test-env$/p' .github/workflows/node-ci.yml | sed '1d;$d' > "$RUNNER_TEMP/test-env.sh"
+          [ -s "$RUNNER_TEMP/test-env.sh" ] || { echo "::error::test-env block not found"; exit 1; }
+          fails=0
+          run_block() { : > "$RUNNER_TEMP/gh-env"; TEST_ENV=$1 GITHUB_ENV="$RUNNER_TEMP/gh-env" bash "$RUNNER_TEMP/test-env.sh" > /dev/null 2>&1; }
+          expect_fail() {
+            if run_block "$1"; then echo "::error::accepted: $2"; fails=1; else echo "ok   rejected: $2"; fi
+            if grep -qE '^(GITHUB_|PATH=|BASH_ENV)' "$RUNNER_TEMP/gh-env"; then echo "::error::dangerous key reached GITHUB_ENV: $2"; fails=1; fi
+          }
+          if run_block $'A=1\n  B=x y=z\n\nC='; then
+            [ "$(cat "$RUNNER_TEMP/gh-env")" = $'A=1\nB=x y=z\nC=' ] || { echo "::error::wrong GITHUB_ENV content"; fails=1; }
+            echo "ok   valid lines written"
+          else echo "::error::valid input rejected"; fails=1; fi
+          expect_fail $'A=1\nGITHUB_PATH=/evil' "second line smuggles GITHUB_PATH"
+          expect_fail 'GITHUB_ENV=/x' "GITHUB_ prefix"
+          expect_fail 'PATH=/evil' "PATH"
+          expect_fail 'BASH_ENV=/evil' "BASH_ENV"
+          expect_fail 'LD_PRELOAD=/evil.so' "LD_PRELOAD"
+          expect_fail 'NO_EQUALS_SIGN' "no ="
+          expect_fail '1BAD=x' "key starts with a digit"
+          expect_fail '=x' "empty key"
+          expect_fail 'A B=c' "space in key"
+          expect_fail $'A=b\rc' "carriage return inside value"
+          expect_fail $'A=1\n$(id)' "command text line"
+          exit "$fails"
 
   actionlint-rejects-bad-workflow:
     runs-on: ubuntu-latest
@@ -164,6 +330,18 @@ jobs:
           for v in GITLEAKS_VERSION GITLEAKS_SHA256; do
             check "$v" .github/workflows/secret-scan.yml || rc=1
           done
+          for v in TRIVY_VERSION TRIVY_IMAGE_DIGEST; do
+            check "$v" .github/workflows/docker-build.yml || rc=1
+          done
+          # The change helper is inline in both workflows; the copies must be identical.
+          blk() { sed -n '/# >>> change-helper$/,/# <<< change-helper$/p' "$1" | sed '1d;$d'; }
+          a=$(blk .github/workflows/node-ci.yml)
+          b=$(blk .github/workflows/docker-build.yml)
+          if [ -z "$a" ] || [ "$a" != "$b" ]; then
+            echo "::error::change-helper differs between node-ci.yml and docker-build.yml"; rc=1
+          else
+            echo "ok change-helper identical in both workflows"
+          fi
           exit "$rc"
 
   ci-ok:
@@ -171,6 +349,12 @@ jobs:
     needs:
       - secret-scan
       - workflow-lint
+      - node-ci
+      - node-ci-no-install
+      - docker-build
+      - crashing-app-fails-boot-test
+      - change-helper-cases
+      - test-env-validation
       - actionlint-rejects-bad-workflow
       - zizmor-rejects-bad-workflow
       - gitleaks-rejects-planted-token

@@ -1,0 +1,151 @@
+name: node-ci
+
+# Reusable. Installs, lints, tests and (when dependency files changed) audits a
+# Node project. The *-command inputs are trusted caller code: they run with
+# `bash -e -o pipefail -c "$VAR"` and are never interpolated into a script.
+# test-env is data, not code: every line is validated before it reaches
+# $GITHUB_ENV. self-test.yml extracts the marked blocks below and tests them.
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory of the Node project, relative to the repo root
+        type: string
+        default: .
+      node-version:
+        description: Node version for actions/setup-node
+        type: string
+        default: "22"
+      install-command:
+        description: Install command. Empty skips install and npm caching
+        type: string
+        default: npm ci
+      lint-command:
+        description: Lint command. Empty skips lint
+        type: string
+        default: npm run lint --if-present
+      setup-command:
+        description: Optional command run before the tests (start a service, seed data). Empty skips
+        type: string
+        default: ""
+      test-env:
+        description: Extra environment for setup and test, one KEY=value per line
+        type: string
+        default: ""
+      test-command:
+        description: Test command. Empty skips the tests with a warning
+        type: string
+        default: npm test
+      audit:
+        description: Run npm audit (high and above, production deps) when package.json or a lockfile changed
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # Which changed files make the audit worth running.
+      CHANGE_RE: '(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json)$'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          # Empty string disables caching (no install, so no lockfile to key on).
+          cache: ${{ inputs.install-command != '' && 'npm' || '' }}
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Install
+        if: inputs.install-command != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+        run: bash -e -o pipefail -c "$INSTALL_COMMAND"
+
+      - name: Lint
+        if: inputs.lint-command != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          LINT_COMMAND: ${{ inputs.lint-command }}
+        run: bash -e -o pipefail -c "$LINT_COMMAND"
+
+      - name: Export test-env
+        if: inputs.test-env != ''
+        env:
+          TEST_ENV: ${{ inputs.test-env }}
+        run: |
+          # >>> test-env
+          set -euo pipefail
+          re='^([A-Za-z_][A-Za-z0-9_]*)=([^[:cntrl:]]*)$'
+          i=0
+          while IFS= read -r line || [ -n "$line" ]; do
+            i=$((i + 1))
+            line=${line%$'\r'}
+            line=${line#"${line%%[![:space:]]*}"}
+            [ -z "$line" ] && continue
+            if ! [[ $line =~ $re ]]; then
+              echo "::error::test-env line $i is not KEY=value"
+              exit 1
+            fi
+            key=${BASH_REMATCH[1]}
+            case "$key" in
+              GITHUB_*|RUNNER_*|ACTIONS_*|DYLD_*|LD_*|PATH|BASH_ENV|BASHOPTS|SHELLOPTS|IFS|PS4|PROMPT_COMMAND|CDPATH|NODE_OPTIONS|NODE_PATH)
+                echo "::error::test-env line $i: $key may not be set here"
+                exit 1
+                ;;
+            esac
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+          done <<< "$TEST_ENV"
+          # <<< test-env
+
+      - name: Setup
+        if: inputs.setup-command != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          SETUP_COMMAND: ${{ inputs.setup-command }}
+        run: bash -e -o pipefail -c "$SETUP_COMMAND"
+
+      - name: Test
+        if: inputs.test-command != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: bash -e -o pipefail -c "$TEST_COMMAND"
+
+      - name: No test command given
+        if: inputs.test-command == ''
+        run: echo "::warning::test-command is empty, no tests were run"
+
+      - name: Did dependency files change?
+        id: audit-changes
+        if: inputs.audit
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          RE: ${{ env.CHANGE_RE }}
+        run: |
+          # >>> change-helper
+          case "$BASE" in ""|0000000000000000000000000000000000000000) echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0 ;; esac
+          FILES=$(git diff --name-only "$BASE" "$HEAD") || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          printf '%s\n' "$FILES" | grep -Eq "$RE" && echo "changed=true" >> "$GITHUB_OUTPUT" || echo "changed=false" >> "$GITHUB_OUTPUT"
+          # <<< change-helper
+
+      - name: npm audit
+        if: inputs.audit && steps.audit-changes.outputs.changed == 'true'
+        working-directory: ${{ inputs.working-directory }}
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: npm audit skipped
+        if: inputs.audit && steps.audit-changes.outputs.changed != 'true'
+        run: echo "package.json and lockfiles unchanged, audit skipped"

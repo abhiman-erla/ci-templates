@@ -1,0 +1,11 @@
+{
+  "name": "ci-templates-fixture-node-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fixture used by ci-templates self-test. Not a real app.",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  }
+}
