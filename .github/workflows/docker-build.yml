@@ -95,7 +95,8 @@ jobs:
           imgre='^ghcr\.io/[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$'
           [[ $image =~ $imgre ]] || fail "image-name must be a lower-case ghcr.io/... name"
           [[ $IN_PORT =~ ^[0-9]{1,5}$ ]] || fail "smoke-port must be a number"
-          [ "$((10#$IN_PORT))" -ge 1 ] && [ "$((10#$IN_PORT))" -le 65535 ] || fail "smoke-port out of range"
+          port=$((10#$IN_PORT))
+          if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then fail "smoke-port out of range"; fi
           urlre='^/[A-Za-z0-9._~/%?=&:@+,-]*$'
           [[ $IN_PATH =~ $urlre ]] || fail "smoke-path must start with / and use URL-safe characters"
           # Changes to the Dockerfile that was actually used also trigger the scan, whatever it is called.
@@ -181,7 +182,10 @@ jobs:
           # >>> change-helper
           case "$BASE" in ""|0000000000000000000000000000000000000000) echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0 ;; esac
           FILES=$(git diff --name-only "$BASE" "$HEAD") || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
-          printf '%s\n' "$FILES" | grep -Eq "$RE" && echo "changed=true" >> "$GITHUB_OUTPUT" || echo "changed=false" >> "$GITHUB_OUTPUT"
+          # grep exits 0 on a match, 1 on no match, 2 on error (for example a bad regex). Only 1 means unchanged.
+          rc=0
+          grep -Eq "$RE" <<<"$FILES" || rc=$?
+          case "$rc" in 1) echo "changed=false" >> "$GITHUB_OUTPUT" ;; *) echo "changed=true" >> "$GITHUB_OUTPUT" ;; esac
           # <<< change-helper
 
       - name: Trivy scan (HIGH and CRITICAL, fixed only)

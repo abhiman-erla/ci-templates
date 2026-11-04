@@ -340,7 +340,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Docs-only is false; lockfile, Dockerfile and unusable bases are true
+      # Two steps: actionlint on Windows stalls on a run script of 4 KiB or more, and
+      # shorter steps are easier to read anyway.
+      - name: Extract the blocks and build a scratch repo
         run: |
           set -euo pipefail
           wf="$PWD/.github/workflows"
@@ -349,13 +351,11 @@ jobs:
           extract "$wf/node-ci.yml" change-helper > "$RUNNER_TEMP/helper-node-ci.sh"
           extract "$wf/docker-build.yml" change-helper > "$RUNNER_TEMP/helper-docker-build.sh"
           extract "$wf/docker-build.yml" validate > "$RUNNER_TEMP/validate.sh"
-          [ -s "$RUNNER_TEMP/validate.sh" ] || { echo "::error::validate block missing in docker-build.yml"; exit 1; }
-          for f in node-ci docker-build; do
-            [ -s "$RUNNER_TEMP/helper-$f.sh" ] || { echo "::error::change-helper block missing in $f.yml"; exit 1; }
+          for f in "helper-node-ci" "helper-docker-build" "validate"; do
+            [ -s "$RUNNER_TEMP/$f.sh" ] || { echo "::error::block missing: $f"; exit 1; }
           done
-          declare -A res
-          res[node-ci]=$(regex_of "$wf/node-ci.yml")
-          res[docker-build]=$(regex_of "$wf/docker-build.yml")
+          regex_of "$wf/node-ci.yml" > "$RUNNER_TEMP/re-node-ci"
+          regex_of "$wf/docker-build.yml" > "$RUNNER_TEMP/re-docker-build"
 
           r="$RUNNER_TEMP/helper-repo"
           rm -rf "$r"; mkdir -p "$r"; cd "$r"
@@ -373,11 +373,22 @@ jobs:
           echo x > api.Dockerfile;                         c7=$(commit named-dockerfile)
           echo x > Containerfile;                          c8=$(commit containerfile)
           mkdir -p docker; echo x > docker/api.prod;       c9=$(commit custom-dockerfile)
+          { echo "c0=$c0"; echo "c1=$c1"; echo "c2=$c2"; echo "c3=$c3"; echo "c4=$c4"; echo "c5=$c5"; echo "c6=$c6"; echo "c7=$c7"; echo "c8=$c8"; echo "c9=$c9"; } > "$RUNNER_TEMP/shas.env"
+
+      - name: Docs-only is false; lockfile, Dockerfile and unusable bases are true
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/shas.env"
+          declare -A res
+          res[node-ci]=$(cat "$RUNNER_TEMP/re-node-ci")
+          res[docker-build]=$(cat "$RUNNER_TEMP/re-docker-build")
+          cd "$RUNNER_TEMP/helper-repo"
           zero=0000000000000000000000000000000000000000
+          bad_re="(" # unmatched parenthesis: grep -E exits 2
           unknown=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 
           fails=0
-          check() { # workflow base head expected label
+          check() { # workflow base head expected label [regex]
             local name=$1 base=$2 head=$3 want=$4 label=$5 re out got
             re=${6:-${res[$name]}}
             out="$RUNNER_TEMP/out-$name"; : > "$out"
@@ -395,7 +406,28 @@ jobs:
             check "$name" "$c0" "$unknown" true "unknown head"
             check "$name" "$zero" "$c3" true "zero base SHA"
             check "$name" "" "$c3" true "empty base"
+            check "$name" "$c0" "$c1" true "invalid regex, grep exit 2, counts as changed" "$bad_re"
           done
+          exit "$fails"
+
+      - name: Dockerfile variants and the resolved dockerfile path
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/shas.env"
+          declare -A res
+          res[node-ci]=$(cat "$RUNNER_TEMP/re-node-ci")
+          res[docker-build]=$(cat "$RUNNER_TEMP/re-docker-build")
+          cd "$RUNNER_TEMP/helper-repo"
+          fails=0
+          check() { # workflow base head expected label [regex]
+            local name=$1 base=$2 head=$3 want=$4 label=$5 re out got
+            re=${6:-${res[$name]}}
+            out="$RUNNER_TEMP/out-$name"; : > "$out"
+            BASE=$base HEAD=$head RE=$re GITHUB_OUTPUT=$out bash "$RUNNER_TEMP/helper-$name.sh"
+            got=$(cat "$out")
+            if [ "$got" = "changed=$want" ]; then echo "ok   $name: $label -> $got"
+            else echo "::error::$name: $label expected changed=$want, got '$got'"; fails=1; fi
+          }
           check docker-build "$c2" "$c3" true  "Dockerfile change"
           check node-ci      "$c2" "$c3" false "Dockerfile change is not an audit trigger"
           check docker-build "$c5" "$c6" true  "Dockerfile.prod"
